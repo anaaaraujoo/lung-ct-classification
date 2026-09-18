@@ -1,7 +1,7 @@
 name: lungct
 
 channels:
-  - conda-forge
+  - radiomics conda-forge
 
 dependencies:
   - python=3.9
