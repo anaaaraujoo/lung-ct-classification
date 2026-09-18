@@ -1,12 +1,8 @@
 name: lungct
 
 channels:
-<<<<<<< Updated upstream
-  - radiomics conda-forge
-=======
   - radiomics 
   - conda-forge
->>>>>>> Stashed changes
 
 dependencies:
   - python=3.9
