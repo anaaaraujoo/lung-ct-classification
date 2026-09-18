@@ -1,7 +1,6 @@
 name: lungct
 
 channels:
-  - radiomics 
   - conda-forge
 
 dependencies:
@@ -15,10 +14,10 @@ dependencies:
   - seaborn
   - pydicom
   - simpleitk
-  - pyradiomics
   - jupyterlab
   - ipykernel
   - tqdm
   - pip
   - pip:
       - pylidc
+      - pyradiomics
