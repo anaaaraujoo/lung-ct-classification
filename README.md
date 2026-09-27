@@ -2,19 +2,11 @@
 
 ## Name
 
-Choose a self-explaining name for your project.
-
 ## Description
-
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
 
 ## Badges
 
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
 ## Visuals
-
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
 
 ## Installation
 
@@ -25,17 +17,26 @@ git clone https://gitlab.up.pt/por-definir/por-definir-ds
 cd por-definir-ds
 ```
 
-Create the conda environment:
+### Using uv
 
 ```bash
-conda env create -f environment.yml
-conda activate lungct
+uv sync
 ```
 
-If the environment file is updated later:
+### Using pip
 
 ```bash
-conda env update -f environment.yml --prune
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Adding new dependencies
+
+To add a new package, please use the *uv add* command and then sync requirements.txt (for pip users) with the following command:
+
+```bash
+uv export --format requirements.txt --no-hashes -o requirements.txt
 ```
 
 ## Usage
