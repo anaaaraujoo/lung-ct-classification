@@ -1,0 +1,46 @@
+setting:
+  label: 1
+  normalize: false
+
+  # Preliminary values; change during preprocessing experiments.
+  binWidth: 25
+  interpolator: sitkBSpline
+  resampledPixelSpacing: [1.0, 1.0, 0.0]
+
+  # Input must contain only the maximal-area axial slice.
+  force2D: true
+  force2Ddimension: 0
+
+  # Causey NGTDM neighbourhood d=1.
+  distances: [1]
+
+  additionalInfo: false
+
+imageType:
+  Original: {}
+
+featureClass:
+  shape2D:
+    - PixelSurface
+    - MeshSurface
+    - Perimeter
+    - Sphericity
+    - MajorAxisLength
+    - MinorAxisLength
+    - Elongation
+
+  firstorder:
+    - Median
+    - Mean
+    - StandardDeviation
+    - Variance
+    - Skewness
+    - Kurtosis
+    - Entropy
+
+  ngtdm:
+    - Coarseness
+    - Contrast
+    - Busyness
+    - Complexity
+    - Strength

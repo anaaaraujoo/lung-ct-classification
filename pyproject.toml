@@ -11,9 +11,12 @@ dependencies = [
     "ipykernel>=6.31.0",
     "matplotlib>=3.9.4",
     "numpy==1.23.5",
+    "pandas>=2.1.0",
     "pylidc==0.2.3",
     "pyradiomics==3.1.0",
+    "scikit-learn>=1.6.1",
     "setuptools<81",
+    "simpleitk>=2.5.6",
 ]
 
 [tool.uv]
