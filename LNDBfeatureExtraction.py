@@ -1,134 +1,131 @@
-#Note: The code has to be edited for extracting features from the entire dataset, this shouldn't be very hard but could require changing the arguments of the function
-#Note: Files paths have to be adjusted before use
-#      Those are on lines 25, 33, 125
+"""Extract circular LNDb radiomics from training or competition centroids."""
 
-#Note: I used a radius of 6mm instead of the one written in the dataset because the test files do not have that,
-#      6mm is around the 97th percentile, the 95th percentile is around 5mm
-
-#I used the following command to install featureextractor from radiomics
-#pip install git+https://github.com/AIM-Harvard/pyradiomics.git
-
-import numpy as np
-import pandas as pd
-import SimpleITK as sitk
+import argparse
 import logging
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from zipfile import ZipFile
+
+import pandas as pd
+import radiomics
+import SimpleITK as sitk
 from radiomics import featureextractor
 
-# Configure pyradiomics logging to avoid redundant warnings in output
-import radiomics
-radiomics.setVerbosity(logging.ERROR)
+from src.radiomics_extraction import (
+    combine_results,
+    create_circle,
+    extract_features,
+    prepare_run,
+    save_csv,
+    save_errors,
+)
 
-def extract_features_for_series(lndb_id):
-    print(f"\nProcessing Series LNDb-{lndb_id:04d}...")
+ROOT = Path(__file__).resolve().parent
+KEYS = ["LNDbID", "FindingID"]
 
-    # 1. Load the SimpleITK image
-    image_path = f'data0/LNDb-{lndb_id:04d}.mhd'
+
+def load_scan(data_dir, lndb_id):
+    scan_name = f"LNDb-{lndb_id:04d}"
+    image_path = data_dir / f"{scan_name}.mhd"
+    if image_path.exists():
+        return sitk.ReadImage(str(image_path))
+
+    # Read one zipped scan through a temporary copy, preserving the original ZIP.
+    with TemporaryDirectory(prefix=f"{scan_name}-") as temporary:
+        with ZipFile(data_dir / f"{scan_name}.zip") as archive:
+            archive.extractall(temporary)
+        image_path = next(Path(temporary).rglob(f"{scan_name}.mhd"))
+        return sitk.ReadImage(str(image_path))
+
+
+def extract_features_for_series(lndb_id, nodules, data_dir, extractor, radius_mm, clip, directory):
+    scan_name = f"LNDb-{lndb_id:04d}"
+    checkpoint = directory / f"{scan_name}.features.csv"
+    rows = pd.read_csv(checkpoint).to_dict("records") if checkpoint.exists() else []
+    completed = {row["FindingID"] for row in rows}
+    pending = nodules[~nodules["FindingID"].isin(completed)]
+    if pending.empty:
+        print(f"{scan_name}: already extracted")
+        return
+
+    print(f"{scan_name}: {len(pending)} nodules, radius {radius_mm:g} mm", flush=True)
+    errors = []
     try:
-        image = sitk.ReadImage(image_path)
-    except Exception as e:
-        print(f"Error reading image {image_path}: {e}")
-        return None
+        image = load_scan(data_dir, lndb_id)
+    except Exception as exc:
+        errors = [{**row, "error": str(exc)} for row in pending[KEYS].to_dict("records")]
+    else:
+        for _, nodule in pending.iterrows():
+            row = {"LNDbID": int(lndb_id), "FindingID": int(nodule["FindingID"])}
+            try:
+                center = tuple(nodule[["x", "y", "z"]].astype(float))
+                image_slice, mask = create_circle(image, center, radius_mm)
+                row.update(extract_features(image_slice, mask, extractor, clip))
+                rows.append(row)
+            except Exception as exc:
+                errors.append({**row, "error": str(exc)})
+        del image
 
-    # 2. Retrieve nodule coordinates from allNods.csv
-    nods_df = pd.read_csv('allNods.csv')
-    filtered_nods = nods_df[nods_df['LNDbID'] == lndb_id].copy()
-    filtered_nods = filtered_nods.dropna(subset=['x', 'y', 'z'])
-
-    if filtered_nods.empty:
-        print(f"No valid nodule annotations found for LNDb-{lndb_id:04d}.")
-        return None
-
-    # Get image geometry parameters
-    origin = np.array(image.GetOrigin())
-    spacing = np.array(image.GetSpacing())
-    image_array = sitk.GetArrayFromImage(image) # depth, height, width
-
-    rows = []
-    # Iterate over all valid nodules for this series
-    for idx, nodule in filtered_nods.iterrows():
-        row = {
-            "patient_id": "LNDb-{lndb_id:04d}",
-            "nodule_id": idx,
-        }
-        finding_id = int(nodule['FindingID']) if 'FindingID' in nodule and not pd.isna(nodule['FindingID']) else idx
-        malignancy_score = nodule['Malignancy'] if 'Malignancy' in nodule and not pd.isna(nodule['Malignancy']) else 'NaN'
-
-        print(f"  - Extracting features for Nodule ID: {finding_id}, Malignancy: {malignancy_score}...")
-        center_physical = np.array([nodule['x'], nodule['y'], nodule['z']])
-        radius_mm = 6.0 #95 percentile is around 5mm, 6mm is around 97% percentile
-
-        # Calculate pixel coordinates for the nodule center to find the central slice
-        pixel_z_center = (center_physical[2] - origin[2]) / spacing[2]
-        nodule_slice_idx = int(round(pixel_z_center))
-
-        # Ensure the slice index is within bounds
-        nodule_slice_idx = max(0, min(nodule_slice_idx, image_array.shape[0] - 1))
-
-        # 3. Create a binary 2D mask on the central nodule slice
-        # Initialize a 3D mask array with zeros
-        mask_array = np.zeros(image_array.shape, dtype=np.uint8)
-
-        # Create 2D meshgrid for the selected slice (y, x dimensions)
-        y_coords_2d, x_coords_2d = np.indices(image_array.shape[1:])
-
-        # Convert 2D pixel coordinates of the slice to physical coordinates
-        # Only use the y and x components of the origin and spacing
-        physical_y_2d = origin[1] + y_coords_2d * spacing[1]
-        physical_x_2d = origin[0] + x_coords_2d * spacing[0]
-
-        # Calculate squared distance to the nodule center in 2D (for the specific slice)
-        dist_squared_2d = ((physical_x_2d - center_physical[0]) ** 2 +
-                           (physical_y_2d - center_physical[1]) ** 2)
-
-        # Mark voxels inside the nodule radius circle as 1 on the selected slice
-        mask_array[nodule_slice_idx, :, :][dist_squared_2d <= (radius_mm ** 2)] = 1        # If the generated mask is completely empty, skip it
-        if np.sum(mask_array) == 0:
-            print(f"    Warning: Generated mask is empty for nodule {finding_id}. Skipping.")
-            continue
-
-        mask_image = sitk.GetImageFromArray(mask_array)
-        mask_image.CopyInformation(image)
-
-        # 4. Initialize Radiomics Extractor & Extract features
-        extractor = featureextractor.RadiomicsFeatureExtractor("causey_2d_vibes.yaml")
-        extractor.enableAllFeatures()
-
-        # Enable specific filters to generate ~1000 features in total
-        extractor.enableImageTypeByName('Original')
-        extractor.enableImageTypeByName('Wavelet')
-        extractor.enableImageTypeByName('Square')
-        extractor.enableImageTypeByName('SquareRoot')
-        extractor.enableImageTypeByName('Logarithm')
-        extractor.enableImageTypeByName('Exponential')
-        extractor.enableImageTypeByName('Gradient')
-
-        try:
-            result = extractor.execute(image, mask_image)
-            # Convert results to DataFrame and insert identifiers
-            row.update(result)
-            row["malignancy"] = malignancy_score
-        except Exception as e:
-            print(f"    Error during extraction for nodule {finding_id}: {e}")
-        rows.append(row)
-
-    return rows
+    if rows:
+        save_csv(pd.DataFrame(rows), checkpoint)
+    save_errors(errors, directory / f"{scan_name}.errors.csv")
 
 
 def main():
-    all_features = []
-    for lndb_id in [1]:
-        df = extract_features_for_series(lndb_id)
-        if df is not None:
-            all_features.extend(df)
-            
-    if all_features:
-        csv_path = 'extracted_features.csv'
-        df = pd.DataFrame(all_features)
-        df.to_csv(csv_path, index=False)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=Path.home() / "Downloads/LNDb")
+    parser.add_argument("--findings", type=Path, help="Training allNods.csv, if stored outside --data-dir.")
+    parser.add_argument("--test-nodules", type=Path, help="Competition CSV with LNDbID, FindingID, x, y, z.")
+    parser.add_argument("--radius", type=float, default=11, help="Radius in mm. Default: full-training LNDb P99.")
+    parser.add_argument("--clip", action="store_true", help="Clip HU to [-1000, 400].")
+    parser.add_argument("--scan", type=int, help="Extract only this LNDbID.")
+    parser.add_argument("--limit-scans", type=int, help="Limit the number of scans for a small run.")
+    parser.add_argument("--config", type=Path, default=ROOT / "configs/radiomics_circle_2d.yaml")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
 
-        print(f"\nSuccess! Features from files saved to: {csv_path}")
-        print(f"Shape of the dataset (Rows, Columns): {df.shape}")
-        print(df.head(15))
+    if args.test_nodules:
+        nodules = pd.read_csv(args.test_nodules)[[*KEYS, "x", "y", "z"]]
+        sources = [Path(__file__), args.test_nodules]
+        dataset = "lndb_test"
+    else:
+        findings_path = args.findings or args.data_dir / "allNods.csv"
+        targets_path = ROOT / "data/processed/lndb_nodule_targets.csv"
+        folds_path = ROOT / "data/processed/lndb_patient_folds.csv"
+        # NoduleID in the targets is the grouped FindingID from allNods.csv.
+        nodules = pd.read_csv(targets_path).rename(columns={"NoduleID": "FindingID"})
+        nodules = nodules.merge(
+            pd.read_csv(findings_path)[[*KEYS, "x", "y", "z"]],
+            on=KEYS, how="left", validate="one_to_one",
+        ).merge(pd.read_csv(folds_path), on="LNDbID", how="left", validate="many_to_one")
+        if nodules["fold"].isna().any():
+            raise ValueError("A patient is missing from the saved folds.")
+        sources = [Path(__file__), findings_path, targets_path, folds_path]
+        dataset = "lndb"
+
+    if nodules[KEYS].isna().any().any() or nodules.duplicated(KEYS).any():
+        raise ValueError("Each nodule must have a unique LNDbID + FindingID.")
+    if args.scan is not None:
+        nodules = nodules[nodules["LNDbID"] == args.scan]
+    if args.limit_scans is not None:
+        if args.limit_scans < 1:
+            raise ValueError("--limit-scans must be positive.")
+        scans = nodules["LNDbID"].drop_duplicates().head(args.limit_scans)
+        nodules = nodules[nodules["LNDbID"].isin(scans)]
+    if nodules.empty:
+        raise ValueError("No nodules match the requested scans.")
+
+    intensity = "clipped" if args.clip else "hu"
+    output = args.output or ROOT / f"data/{dataset}_circle_r{args.radius:g}_{intensity}.csv"
+    directory = prepare_run(output, args.config, args.radius, args.clip, sources)
+    radiomics.setVerbosity(logging.ERROR)
+    extractor = featureextractor.RadiomicsFeatureExtractor(str(args.config))
+    for lndb_id, scan_nodules in nodules.groupby("LNDbID", sort=False):
+        extract_features_for_series(
+            int(lndb_id), scan_nodules, args.data_dir, extractor, args.radius, args.clip, directory
+        )
+    return int(combine_results(directory, nodules, KEYS, output) > 0)
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

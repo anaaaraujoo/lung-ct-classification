@@ -2,3 +2,7 @@
 # i used it to fill the csv file with random predictions
 gen_preds.py
 __pycache__
+
+# Generated radiomics tables and resumable per-scan results.
+data/*_circle_*.csv
+data/*_circle_*.scans/

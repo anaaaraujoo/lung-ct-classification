@@ -1,81 +1,118 @@
-#Note: I only tested this on one patient, adjust the filters on lines 25-28 to change the patients
-#Note: Please verify if the files paths on those lines are correct: 30,77
-#Note: The file /root/.pylidcr has to contain the path to the dataset
-#Note: Lines 17-19 are only here because I had some strange issues, tell me if you can run the program without them
+"""Extract circular LIDC radiomics and join the saved targets and folds."""
 
-#Question: Are citations necessary for the decision of the features we extract?
-#Reminder: we still need to think about how we're selecting thes ROI, it probably needs to be consistent between datasets
+import argparse
+import logging
+from pathlib import Path
 
-import pylidc as pl
-import SimpleITK as sitk
 import numpy as np
-from pylidc.utils import consensus
-from radiomics import featureextractor
 import pandas as pd
-import os
+import pylidc as pl
+import radiomics
+import SimpleITK as sitk
+from radiomics import featureextractor
 
-import configparser
-np.int = int
-configparser.SafeConfigParser = configparser.ConfigParser
+from src.radiomics_extraction import (
+    combine_results,
+    create_circle,
+    extract_features,
+    prepare_run,
+    save_csv,
+    save_errors,
+)
+
+ROOT = Path(__file__).resolve().parent
+KEYS = ["patient_id", "series_uid", "nodule_id"]
+
 
 def main():
-#----------Preprocessing/Feature Engineering----------------
-# the pyradiomics pipeline is responsible for the resampling
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--radius", type=float, default=21, help="Radius in mm. Default: full-training LIDC P99.")
+    parser.add_argument("--clip", action="store_true", help="Clip HU to [-1000, 400].")
+    parser.add_argument("--patient", help="Extract only this patient ID.")
+    parser.add_argument("--limit-scans", type=int, help="Limit the number of CT series for a small run.")
+    parser.add_argument("--config", type=Path, default=ROOT / "configs/radiomics_circle_2d.yaml")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
 
-    #scans = pl.query(pl.Scan)
+    targets_path = ROOT / "data/processed/lidc_nodule_targets.csv"
+    folds_path = ROOT / "data/processed/lidc_patient_folds.csv"
+    annotations_path = ROOT / "data/processed/lidc_annotations_clean.csv"
+    nodules = pd.read_csv(targets_path).merge(
+        pd.read_csv(folds_path), on="patient_id", how="left", validate="many_to_one"
+    )
+    if nodules[KEYS + ["fold"]].isna().any().any() or nodules.duplicated(KEYS).any():
+        raise ValueError("Targets must have unique nodule IDs and a fold for every patient.")
+    if args.patient:
+        nodules = nodules[nodules["patient_id"] == args.patient]
+    if args.limit_scans is not None:
+        if args.limit_scans < 1:
+            raise ValueError("--limit-scans must be positive.")
+        series = nodules["series_uid"].drop_duplicates().head(args.limit_scans)
+        nodules = nodules[nodules["series_uid"].isin(series)]
+    if nodules.empty:
+        raise ValueError("No nodules match the requested scans.")
 
-    pid = 'LIDC-IDRI-0879'
-    scans = pl.query(pl.Scan).filter(pl.Scan.patient_id == pid)
+    # Use saved centroids and zero-based IDs, avoiding any reordering of clusters.
+    annotations = pd.read_csv(annotations_path)
+    annotations[["row", "column", "slice"]] = np.stack(
+        annotations["centroid"].map(lambda value: np.fromstring(value.strip("[]"), sep=" "))
+    )
+    centers = annotations.groupby(KEYS)[["row", "column", "slice"]].mean()
+    scan_rows = nodules.merge(centers, on=KEYS, how="left", validate="one_to_one")
+    if scan_rows[["row", "column", "slice"]].isna().any().any():
+        raise ValueError("A nodule is missing its saved centroid.")
 
-    extractor = featureextractor.RadiomicsFeatureExtractor("/config/causey_2d_vibes.yaml")
-    extractor.enableAllFeatures()
-    extractor.enableImageTypeByName('Original')
-    extractor.enableImageTypeByName('Wavelet')
-    extractor.enableImageTypeByName('Square')
-    extractor.enableImageTypeByName('SquareRoot')
-    extractor.enableImageTypeByName('Logarithm')
-    extractor.enableImageTypeByName('Exponential')
-    extractor.enableImageTypeByName('Gradient')
-    rows = []
-    for scan in scans:
-        nods = scan.cluster_annotations()
-        vol = scan.to_volume(verbose=False)
+    intensity = "clipped" if args.clip else "hu"
+    output = args.output or ROOT / f"data/lidc_circle_r{args.radius:g}_{intensity}.csv"
+    directory = prepare_run(
+        output, args.config, args.radius, args.clip,
+        [Path(__file__), targets_path, folds_path, annotations_path],
+    )
+    radiomics.setVerbosity(logging.ERROR)
+    extractor = featureextractor.RadiomicsFeatureExtractor(str(args.config))
+
+    for (patient_id, series_uid), scan_nodules in scan_rows.groupby(["patient_id", "series_uid"], sort=False):
+        scan_name = f"{patient_id}_{series_uid}"
+        checkpoint = directory / f"{scan_name}.features.csv"
+        rows = pd.read_csv(checkpoint).to_dict("records") if checkpoint.exists() else []
+        completed = {row["nodule_id"] for row in rows}
+        pending = scan_nodules[~scan_nodules["nodule_id"].isin(completed)]
+        if pending.empty:
+            print(f"{patient_id} / {series_uid}: already extracted")
+            continue
+
+        print(f"{patient_id}: {len(pending)} nodules, radius {args.radius:g} mm", flush=True)
+        errors = []
+        try:
+            scan = pl.query(pl.Scan).filter(
+                pl.Scan.patient_id == patient_id, pl.Scan.series_instance_uid == series_uid
+            ).one()
+            volume = scan.to_volume(verbose=False)
+            image = sitk.GetImageFromArray(volume.transpose(2, 0, 1))
+            image.SetSpacing((scan.pixel_spacing, scan.pixel_spacing, scan.slice_spacing))
+            del volume
+        except Exception as exc:
+            errors = [{**row, "error": str(exc)} for row in pending[KEYS].to_dict("records")]
+        else:
+            for _, nodule in pending.iterrows():
+                row = {"patient_id": patient_id, "series_uid": series_uid, "nodule_id": int(nodule["nodule_id"])}
+                try:
+                    # PyLIDC indices are [row, column, slice], SimpleITK uses [x, y, z].
+                    index = tuple(nodule[["column", "row", "slice"]].astype(float))
+                    center = image.TransformContinuousIndexToPhysicalPoint(index)
+                    image_slice, mask = create_circle(image, center, args.radius)
+                    row.update(extract_features(image_slice, mask, extractor, args.clip))
+                    rows.append(row)
+                except Exception as exc:
+                    errors.append({**row, "error": str(exc)})
+            del image
+
+        if rows:
+            save_csv(pd.DataFrame(rows), checkpoint)
+        save_errors(errors, directory / f"{scan_name}.errors.csv")
+
+    return int(combine_results(directory, nodules, KEYS, output) > 0)
 
 
-        for nod_id, anns in enumerate(nods, start=1):
-            row = {
-                "patient_id": scan.patient_id,
-                "nodule_id": nod_id,
-            }
-            # Perform a consensus consolidation and 50% agreement level.
-            cmask,cbbox,_ = consensus(anns, clevel=0.5)
-
-            # get the largest mask slice
-            mask_slice_index = np.argmax(cmask.sum(axis=(0, 1)))
-            scan_slice_index = cbbox[2].start + mask_slice_index
-
-            # in the yaml file, the resampling happens on a 3d array
-            slice_vol = vol[:,:,scan_slice_index:scan_slice_index+1]
-            image = sitk.GetImageFromArray(np.transpose(slice_vol, (2,0,1)))
-            image.SetSpacing((scan.pixel_spacing,scan.pixel_spacing,scan.slice_spacing))
-
-            mask_array = np.zeros(slice_vol.shape, dtype=np.uint8)
-            mask_array[cbbox[0], cbbox[1], 0] = cmask[:, :, mask_slice_index]
-            mask_image = sitk.GetImageFromArray(np.transpose(mask_array, (2,0,1)))
-            mask_image.CopyInformation(image)
-
-            result = extractor.execute(image, mask_image)
-
-            row.update(result)
-            # we will experiment with both the mean and median
-            ratings = [ann.malignancy for ann in anns]
-            row["malignancy_mean"] = float(np.mean(ratings))
-            row["malignancy_median"] = float(np.median(ratings))
-            rows.append(row)
-
-    df = pd.DataFrame(rows)
-    df.to_csv("/extracted_features.csv", index=False)
-
-
-if __name__=="__main__":
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())

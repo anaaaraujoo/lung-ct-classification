@@ -1,0 +1,34 @@
+setting:
+  label: 1
+  normalize: false
+
+  binWidth: 25
+  interpolator: sitkBSpline
+  resampledPixelSpacing: [0.7, 0.7, 0]
+
+  # Input contains only the slice nearest the centroid.
+  force2D: true
+  # Exclude the slice axis from texture-neighbour comparisons, not slice number 0.
+  force2Ddimension: 0
+
+  distances: [1]
+
+  additionalInfo: false
+
+imageType:
+  Original: {}
+  Wavelet: {}
+  Square: {}
+  SquareRoot: {}
+  Logarithm: {}
+  Exponential: {}
+  Gradient: {}
+
+# Shape would describe the artificial circle rather than the nodule.
+featureClass:
+  firstorder: []
+  glcm: []
+  glrlm: []
+  glszm: []
+  gldm: []
+  ngtdm: []
