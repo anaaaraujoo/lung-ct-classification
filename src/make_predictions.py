@@ -1,4 +1,4 @@
-"""Fill the competition submission using a saved Random Forest model."""
+"""Fill the competition submission using a saved classifier."""
 import argparse
 from pathlib import Path
 import joblib
@@ -25,7 +25,7 @@ def main():
         raise ValueError("The test features do not match the saved model.")
 
     X = table[features].replace([np.inf, -np.inf], np.nan)
-    predictions = model.predict(X)
+    predictions = model.predict(X) + saved.get("label_offset", 0)
     predicted = table[KEYS].copy()
     predicted["prediction"] = predictions.astype(int)
 

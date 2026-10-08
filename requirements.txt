@@ -46,6 +46,8 @@ imageio==2.37.2 ; python_full_version < '3.10'
     # via scikit-image
 imageio==2.37.4 ; python_full_version >= '3.10'
     # via scikit-image
+imbalanced-learn==0.12.4
+    # via por-definir-ds
 importlib-metadata==8.7.1 ; python_full_version < '3.10'
     # via jupyter-client
 importlib-resources==6.5.2 ; python_full_version < '3.10'
@@ -67,9 +69,13 @@ jedi==0.19.2 ; python_full_version < '3.10'
 jedi==0.20.0 ; python_full_version >= '3.10'
     # via ipython
 joblib==1.5.3 ; python_full_version < '3.10'
-    # via scikit-learn
+    # via
+    #   imbalanced-learn
+    #   scikit-learn
 joblib==1.6.0 ; python_full_version >= '3.10'
-    # via scikit-learn
+    # via
+    #   imbalanced-learn
+    #   scikit-learn
 jupyter-client==8.6.3 ; python_full_version < '3.10'
     # via ipykernel
 jupyter-client==8.10.0 ; python_full_version >= '3.10'
@@ -116,6 +122,7 @@ numpy==1.23.5
     # via
     #   contourpy
     #   imageio
+    #   imbalanced-learn
     #   matplotlib
     #   pandas
     #   por-definir-ds
@@ -126,6 +133,9 @@ numpy==1.23.5
     #   scikit-learn
     #   scipy
     #   tifffile
+    #   xgboost
+nvidia-nccl-cu12==2.32.3 ; platform_machine != 'aarch64' and sys_platform == 'linux'
+    # via xgboost
 packaging==26.3
     # via
     #   ipykernel
@@ -206,20 +216,24 @@ ruamel-yaml==0.19.1
     # via pykwalify
 scikit-image==0.24.0
     # via pylidc
-scikit-learn==1.6.1 ; python_full_version < '3.10'
-    # via por-definir-ds
-scikit-learn==1.7.2 ; python_full_version >= '3.10'
-    # via por-definir-ds
+scikit-learn==1.6.1
+    # via
+    #   imbalanced-learn
+    #   por-definir-ds
 scipy==1.13.1 ; python_full_version < '3.10'
     # via
+    #   imbalanced-learn
     #   pylidc
     #   scikit-image
     #   scikit-learn
+    #   xgboost
 scipy==1.15.3 ; python_full_version >= '3.10'
     # via
+    #   imbalanced-learn
     #   pylidc
     #   scikit-image
     #   scikit-learn
+    #   xgboost
 setuptools==80.10.2
     # via por-definir-ds
 simpleitk==2.5.6
@@ -237,7 +251,9 @@ sqlalchemy==2.1.0 ; python_full_version >= '3.11'
 stack-data==0.6.3
     # via ipython
 threadpoolctl==3.7.0
-    # via scikit-learn
+    # via
+    #   imbalanced-learn
+    #   scikit-learn
 tifffile==2024.8.30 ; python_full_version < '3.10'
     # via scikit-image
 tifffile==2025.5.10 ; python_full_version == '3.10.*'
@@ -272,6 +288,8 @@ tzdata==2026.4
     # via pandas
 wcwidth==0.9.1
     # via prompt-toolkit
+xgboost==2.1.4
+    # via por-definir-ds
 zipp==3.23.1 ; python_full_version < '3.10'
     # via
     #   importlib-metadata
