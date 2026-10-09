@@ -1,4 +1,4 @@
-"""Shared circular radiomics extraction and per-scan progress saving."""
+"""Shared 2D radiomics extraction and per-scan progress saving."""
 
 import hashlib
 import json
@@ -35,6 +35,51 @@ def create_circle(image, center_xyz, radius_mm):
     return image_slice, mask
 
 
+def check_mask_geometry(image, mask):
+    """Reject misaligned masks rather than silently changing their geometry."""
+    if image.GetDimension() != 3 or mask.GetDimension() != 3 or image.GetSize() != mask.GetSize():
+        raise ValueError("Mask and CT must have the same 3D dimensions.")
+    for attribute in ("GetOrigin", "GetSpacing", "GetDirection"):
+        if not np.allclose(getattr(image, attribute)(), getattr(mask, attribute)(), atol=1e-6, rtol=0):
+            raise ValueError(f"Mask and CT differ in {attribute[3:].lower()}.")
+
+
+def combine_reader_masks(masks):
+    """At least half of the associated nodule readers must include each voxel."""
+    votes, count = None, 0
+    for mask in masks:
+        mask = np.asarray(mask)
+        if mask.ndim != 3 or not np.isin(mask, [0, 1]).all() or not mask.any():
+            raise ValueError("Every reader must have a non-empty binary 3D nodule mask.")
+        if votes is None:
+            votes = np.zeros(mask.shape, dtype=np.uint16)
+        if mask.shape != votes.shape:
+            raise ValueError("Reader masks must share the same voxel grid.")
+        votes += mask.astype(bool, copy=False)
+        count += 1
+    if count == 0:
+        raise ValueError("No reader masks found for this nodule.")
+    # With two readers, 50% includes voxels marked by either reader.
+    combined = (votes >= (count + 1) // 2).astype(np.uint8)
+    if not combined.any():
+        raise ValueError("The 50% consensus mask is empty.")
+    return combined
+
+
+def largest_mask_slice(image, mask):
+    """Return one axial slice, its binary mask and the original slice index."""
+    check_mask_geometry(image, mask)
+    values = sitk.GetArrayViewFromImage(mask)
+    if not np.isin(values, [0, 1]).all():
+        raise ValueError("The nodule mask must be binary.")
+    areas = np.count_nonzero(values, axis=(1, 2))
+    if not areas.any():
+        raise ValueError("The nodule mask is empty.")
+    # np.argmax chooses the first slice if several have the same largest area.
+    index = int(np.argmax(areas))
+    return image[:, :, index:index + 1], mask[:, :, index:index + 1], index
+
+
 def extract_features(image, mask, extractor, clip=False):
     # Preserve fractional HU values when resampling.
     image = sitk.Cast(image, sitk.sitkFloat32)
@@ -44,22 +89,36 @@ def extract_features(image, mask, extractor, clip=False):
             if not name.startswith("diagnostics_")}
 
 
-def prepare_run(output, config, radius_mm, clip, sources):
+def file_checksum(path):
+    """Hash large inputs, such as masks.zip, without loading them into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def prepare_run(output, config, radius_mm, clip, sources, roi="circle"):
     """Resume only when settings, source tables and extraction code match."""
-    if radius_mm <= 0 or not np.isfinite(radius_mm):
+    if roi not in ("circle", "segmentation"):
+        raise ValueError("ROI must be circle or segmentation.")
+    if roi == "circle" and (radius_mm is None or radius_mm <= 0 or not np.isfinite(radius_mm)):
         raise ValueError("Radius must be a positive finite number.")
     directory = output.with_suffix(".scans")
     settings_path = directory / "settings.json"
     settings = {
-        "radius_mm": radius_mm,
+        "roi": roi,
+        "radius_mm": radius_mm if roi == "circle" else None,
         "clip": clip,
         "pyradiomics_version": radiomics.__version__,
         "config": config.read_text(),
         "sources": {
-            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            path.name: file_checksum(path)
             for path in [Path(__file__), *sources]
         },
     }
+    if roi == "segmentation":
+        settings.update(consensus=0.5, slice_selection="largest_mask_area")
     if settings_path.exists():
         if json.loads(settings_path.read_text()) != settings:
             raise ValueError("Settings or inputs changed. Choose a different --output file.")

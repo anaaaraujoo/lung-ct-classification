@@ -1,0 +1,32 @@
+setting:
+  label: 1
+  normalize: false
+
+  binWidth: 25
+  interpolator: sitkBSpline
+  resampledPixelSpacing: [0.7, 0.7, 0]
+
+  # Input contains only the largest-area axial slice of the 50% consensus mask.
+  force2D: true
+  force2Ddimension: 0
+  distances: [1]
+  additionalInfo: false
+
+imageType:
+  Original: {}
+  Wavelet: {}
+  Square: {}
+  SquareRoot: {}
+  Logarithm: {}
+  Exponential: {}
+  Gradient: {}
+
+# Shape describes the real nodule mask, and is computed on Original only.
+featureClass:
+  shape2D: []
+  firstorder: []
+  glcm: []
+  glrlm: []
+  glszm: []
+  gldm: []
+  ngtdm: []

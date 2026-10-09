@@ -12,25 +12,39 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import balanced_accuracy_score, cohen_kappa_score, confusion_matrix, f1_score, mean_absolute_error, recall_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, cohen_kappa_score, confusion_matrix, f1_score, make_scorer, mean_absolute_error, recall_score
+from sklearn.model_selection import GridSearchCV, PredefinedSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "target_classification_mean"
-FEATURE_PATTERN = r"_(firstorder|glcm|glrlm|glszm|gldm|ngtdm)_"
+FEATURE_PATTERN = r"_(shape2D|firstorder|glcm|glrlm|glszm|gldm|ngtdm)_"
+MIN_SAMPLES_GRID = {
+    "randomforestclassifier__min_samples_leaf": [1, 5, 10, 20],
+    "randomforestclassifier__min_samples_split": [2, 10, 20, 40],
+}
 
 
-def load_data(path, dataset):
+def load_data(path, dataset, targets_path=None):
+    """Load every requested nodule and use its saved patient fold."""
     table = pd.read_csv(path)
     features = table.filter(regex=FEATURE_PATTERN).columns.tolist()
     keys = ["patient_id", "series_uid", "nodule_id"] if dataset == "lidc" else ["LNDbID", "FindingID"]
-    targets = pd.read_csv(ROOT / f"data/processed/{dataset}_nodule_targets.csv").rename(columns={"NoduleID": "FindingID"})
+    targets_file = targets_path or ROOT / f"data/processed/{dataset}_nodule_targets.csv"
+    targets = pd.read_csv(targets_file).rename(columns={"NoduleID": "FindingID"})
+    # An explicit target table defines the experiment's population, including for the circle comparison.
+    target_columns = keys + [name for name in targets if name == "ratings" or name.startswith("target_")]
+    targets = targets[target_columns]
+    if targets.empty or targets[keys].isna().any().any() or targets.duplicated(keys).any():
+        raise ValueError("Targets must contain unique, non-missing nodule IDs.")
+    if table[keys].isna().any().any() or table.duplicated(keys).any():
+        raise ValueError(f"{path}: feature rows must have unique, non-missing nodule IDs.")
     folds = pd.read_csv(ROOT / f"data/processed/{dataset}_patient_folds.csv")
     data = targets.merge(folds, on=keys[0], validate="many_to_one", how="left")
     data = data.merge(table[keys + features], on=keys, validate="one_to_one", how="left", indicator=True)
-    if not features or len(table) != len(targets) or data["_merge"].ne("both").any():
+    if not features or (targets_path is None and len(table) != len(targets)) or data["_merge"].ne("both").any():
         raise ValueError(f"{path}: expected features for all {len(targets)} training nodules.")
     if data["fold"].isna().any() or not data[TARGET].isin([1, 2, 3, 4, 5]).all():
         raise ValueError(f"{dataset}: missing folds or invalid target classes.")
@@ -74,10 +88,30 @@ def metrics(y, prediction):
             "mae": mean_absolute_error(y, prediction)}
 
 
+def lndb_cv(train, n_lidc):
+    """Validate on saved LNDb folds, keeping the leading LIDC rows in training only."""
+    test_fold = train["fold"].to_numpy().copy()
+    test_fold[:n_lidc] = -1
+    return PredefinedSplit(test_fold)
+
+
+def tune_rf(model, train, features, n_lidc, output, fold):
+    scorer = make_scorer(f1_score, labels=[1, 2, 3, 4, 5], average="macro", zero_division=0)
+    search = GridSearchCV(model, MIN_SAMPLES_GRID, scoring=scorer, cv=lndb_cv(train, n_lidc),
+                          n_jobs=1, error_score="raise", return_train_score=True, verbose=2)
+    # Parallelize the 500 trees, not searches and trees simultaneously.
+    search.fit(train[features], train[TARGET])
+    pd.DataFrame(search.cv_results_).to_csv(output / f"grid_{fold}.csv", index=False)
+    print(f"Best inner macro F1: {search.best_score_:.4f}, parameters: {search.best_params_}", flush=True)
+    return search
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lidc", type=Path, default=ROOT / "data/lidc_circle_r21_hu.csv")
     parser.add_argument("--lndb", type=Path, default=ROOT / "data/lndb_circle_r11_hu.csv")
+    parser.add_argument("--lidc-targets", type=Path, help="Explicit LIDC nodule population. Default: all cleaned LIDC targets.")
+    parser.add_argument("--lndb-targets", type=Path, help="Explicit LNDb nodule population, e.g. the saved ge3 targets.")
     parser.add_argument("--lndb-only", action="store_true", help="Train using only the LNDb training folds.")
     parser.add_argument("--class-weight", choices=["none", "balanced"], default="none")
     parser.add_argument("--model", choices=["rf", "logistic", "xgboost"], default="rf")
@@ -85,6 +119,7 @@ def main():
     parser.add_argument("--smote", action="store_true", help="Scale features and balance classes with SMOTE on training data only.")
     parser.add_argument("--balanced-forest", action="store_true", help="Balance each tree's training sample by undersampling.")
     parser.add_argument("--k", type=int, help="Select the K best features inside each training fold. Default: use all.")
+    parser.add_argument("--tune-rf", action="store_true", help="Tune RF minimum leaf and split sizes inside the saved training folds, selecting by macro F1.")
     parser.add_argument("--output", type=Path, help="Directory for this experiment's results and model.")
     args = parser.parse_args()
     if args.smote and args.class_weight != "none":
@@ -93,16 +128,18 @@ def main():
         parser.error("Use --balanced-forest without SMOTE or class weights to test undersampling separately.")
     if args.balanced_forest and args.model != "rf":
         parser.error("--balanced-forest requires --model rf.")
+    if args.tune_rf and (args.model != "rf" or args.balanced_forest or args.smote):
+        parser.error("--tune-rf requires ordinary RF without SMOTE or --balanced-forest.")
     if args.smote or args.balanced_forest:
         # imbalanced-learn 0.12 uses these older APIs, which still work in sklearn 1.6.
         warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn\.base",
                                 message=r"`BaseEstimator\._(validate_data|check_feature_names|check_n_features)` is deprecated")
         warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn\.utils\.deprecation",
                                 message="'force_all_finite' was renamed to 'ensure_all_finite'")
-    lndb, features = load_data(args.lndb, "lndb")
+    lndb, features = load_data(args.lndb, "lndb", args.lndb_targets)
     lidc = lndb.head(0)
     if not args.lndb_only:
-        lidc, lidc_features = load_data(args.lidc, "lidc")
+        lidc, lidc_features = load_data(args.lidc, "lidc", args.lidc_targets)
         if set(features) != set(lidc_features):
             raise ValueError("LIDC and LNDb must contain the same radiomics features.")
         features = lidc_features
@@ -119,17 +156,28 @@ def main():
         raise ValueError("Expected five saved LNDb folds.")
     name = args.lndb.stem if args.lndb_only else f"{args.lidc.stem}_{args.lndb.stem}"
     kind = "brf" if args.balanced_forest else args.model
-    output = args.output or ROOT / "models" / f"{kind}_{name}{'_balanced' if class_weight else ''}{f'_k{args.k}' if args.k is not None else ''}{'_smote' if args.smote else ''}{'_original' if args.original_only else ''}"
+    output = args.output or ROOT / "models" / f"{kind}_{name}{'_balanced' if class_weight else ''}{f'_k{args.k}' if args.k is not None else ''}{'_smote' if args.smote else ''}{'_original' if args.original_only else ''}{'_tuned' if args.tune_rf else ''}"
     output.mkdir(parents=True, exist_ok=True)
     predictions = pd.Series(index=lndb.index, dtype=float)
     scores = []
+    tuning, training_scores = [], []
     print(f"{kind}: {len(features)} features, class weights: {args.class_weight}", flush=True)
     for fold in folds:
         held_out = lndb["fold"].eq(fold)
         train = pd.concat([lidc, lndb.loc[~held_out]], ignore_index=True)
         model = make_model(class_weight, args.k, args.smote, args.balanced_forest, args.model)
         print(f"Fold {fold}: {len(train)} training / {held_out.sum()} validation nodules", flush=True)
-        fit_model(model, train[features], train[TARGET], class_weight, label_offset)
+        if args.tune_rf:
+            search = tune_rf(model, train, features, len(lidc), output, f"fold_{fold}")
+            model = search.best_estimator_
+            tuning.append({"fold": fold, "inner_macro_f1": search.best_score_, **search.best_params_})
+            training_prediction = model.predict(train[features])
+            training_scores.append({"fold": fold, "accuracy": accuracy_score(train[TARGET], training_prediction),
+                                    **metrics(train[TARGET], training_prediction)})
+            pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
+            pd.DataFrame(training_scores).to_csv(output / "training_metrics.csv", index=False)
+        else:
+            fit_model(model, train[features], train[TARGET], class_weight, label_offset)
         prediction = model.predict(lndb.loc[held_out, features]) + label_offset
         predictions.loc[held_out] = prediction
         scores.append({"fold": fold, **metrics(lndb.loc[held_out, TARGET], prediction)})
@@ -146,12 +194,27 @@ def main():
     print(f"Fitting final model on all {'LNDb' if args.lndb_only else 'LIDC + LNDb'} training nodules", flush=True)
     train = pd.concat([lidc, lndb], ignore_index=True)
     model = make_model(class_weight, args.k, args.smote, args.balanced_forest, args.model)
-    fit_model(model, train[features], train[TARGET], class_weight, label_offset)
+    tuning_info = {}
+    if args.tune_rf:
+        # Choose final parameters using all five LNDb folds, never competition test data.
+        search = tune_rf(model, train, features, len(lidc), output, "final")
+        model = search.best_estimator_
+        tuning.append({"fold": "final", "inner_macro_f1": search.best_score_, **search.best_params_})
+        pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
+        tuning_info = {"param_grid": MIN_SAMPLES_GRID, "tuning_scoring": "macro_f1",
+                       "best_params": search.best_params_, "inner_cv": "saved LNDb folds, LIDC training only"}
+    else:
+        fit_model(model, train[features], train[TARGET], class_weight, label_offset)
+    lidc_targets_path = args.lidc_targets or ROOT / "data/processed/lidc_nodule_targets.csv"
+    lndb_targets_path = args.lndb_targets or ROOT / "data/processed/lndb_nodule_targets.csv"
     joblib.dump({"model": model, "features": features, "target": TARGET,
                  "lidc_csv": None if args.lndb_only else str(args.lidc.resolve()),
                  "lndb_csv": str(args.lndb.resolve()), "class_weight": class_weight, "k": args.k,
+                 "lidc_targets_csv": None if args.lndb_only else str(lidc_targets_path.resolve()),
+                 "lndb_targets_csv": str(lndb_targets_path.resolve()),
                  "smote": args.smote, "balanced_forest": args.balanced_forest,
-                 "model_kind": args.model, "label_offset": label_offset, "original_only": args.original_only}, output / "model.joblib")
+                 "model_kind": args.model, "label_offset": label_offset, "original_only": args.original_only,
+                 **tuning_info}, output / "model.joblib")
     print(f"Saved metrics, validation predictions and model to {output}")
 
 
