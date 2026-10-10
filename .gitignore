@@ -7,4 +7,6 @@ data/*.scans/
 data/**/*.errors.csv
 #it was taking too long:
 models/
-data/
+data/*
+!data/lidc_circle_r11_hu.csv
+!data/lndb_circle_r6_hu.csv
