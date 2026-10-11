@@ -52,6 +52,36 @@ def create_circle(image, center_xyz, radius_mm):
     return image_slice, mask
 
 
+def create_sphere(image, center_xyz, radius_mm):
+    """Return the full CT and a spherical mask defined in millimetres."""
+    if radius_mm <= 0 or not np.isfinite(radius_mm):
+        raise ValueError("Radius must be a positive finite number.")
+    if not np.isfinite(center_xyz).all():
+        raise ValueError("Nodule centroid contains missing or non-finite coordinates.")
+
+    center = np.array(image.TransformPhysicalPointToContinuousIndex(
+        tuple(float(value) for value in center_xyz)
+    ))
+    size = np.array(image.GetSize())
+    if np.any(center < 0) or np.any(center > size - 1):
+        raise ValueError("Nodule centroid is outside the scan.")
+    spacing = np.array(image.GetSpacing())
+    # Compute distances only near the centre, retaining a full-volume mask.
+    lower = np.maximum(np.floor(center - radius_mm / spacing), 0).astype(int)
+    upper = np.minimum(np.ceil(center + radius_mm / spacing) + 1, size).astype(int)
+    z, y, x = np.ogrid[lower[2]:upper[2], lower[1]:upper[1], lower[0]:upper[0]]
+    distance_squared = (
+        ((x - center[0]) * spacing[0]) ** 2
+        + ((y - center[1]) * spacing[1]) ** 2
+        + ((z - center[2]) * spacing[2]) ** 2
+    )
+    values = np.zeros(tuple(reversed(image.GetSize())), dtype=np.uint8)
+    values[lower[2]:upper[2], lower[1]:upper[1], lower[0]:upper[0]] = distance_squared <= radius_mm ** 2
+    mask = sitk.GetImageFromArray(values)
+    mask.CopyInformation(image)
+    return image, mask
+
+
 def check_mask_geometry(image, mask):
     """Reject misaligned masks rather than silently changing their geometry."""
     if image.GetDimension() != 3 or mask.GetDimension() != 3 or image.GetSize() != mask.GetSize():
@@ -138,11 +168,11 @@ def file_checksum(path):
 
 def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensus_level=0.5, bin_width=None, dimension=2):
     """Resume only when settings, source tables and extraction code match."""
-    if roi not in ("circle", "segmentation"):
-        raise ValueError("ROI must be circle or segmentation.")
-    if dimension not in (2, 3) or (dimension == 3 and roi != "segmentation"):
-        raise ValueError("Dimension must be 2, or 3 for segmentation.")
-    if roi == "circle" and (radius_mm is None or radius_mm <= 0 or not np.isfinite(radius_mm)):
+    if roi not in ("circle", "sphere", "segmentation"):
+        raise ValueError("ROI must be circle, sphere or segmentation.")
+    if dimension not in (2, 3) or (dimension == 3 and roi == "circle") or (dimension == 2 and roi == "sphere"):
+        raise ValueError("Use dimension 2 for circles, 3 for spheres, or either for segmentation.")
+    if roi in ("circle", "sphere") and (radius_mm is None or radius_mm <= 0 or not np.isfinite(radius_mm)):
         raise ValueError("Radius must be a positive finite number.")
     if bin_width is not None and (not np.isfinite(bin_width) or bin_width <= 0):
         raise ValueError("Bin width must be a positive finite number.")
@@ -150,7 +180,7 @@ def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensu
     settings_path = directory / "settings.json"
     settings = {
         "roi": roi,
-        "radius_mm": radius_mm if roi == "circle" else None,
+        "radius_mm": radius_mm if roi in ("circle", "sphere") else None,
         "clip": clip,
         "pyradiomics_version": radiomics.__version__,
         "config": config.read_text(),

@@ -55,6 +55,7 @@ class PathTests(unittest.TestCase):
         self.assertEqual(paths["lndb"]["segmentation_targets"], ROOT / "data/processed/lndb_ge3_nodule_targets.csv")
         self.assertEqual(paths["radiomics"]["segmentation"], ROOT / "configs/radiomics_segmentation_2d.yaml")
         self.assertEqual(paths["radiomics"]["segmentation_3d"], ROOT / "configs/radiomics_segmentation_3d.yaml")
+        self.assertEqual(paths["radiomics"]["sphere_3d"], ROOT / "configs/radiomics_sphere_3d.yaml")
         self.assertEqual(paths["training"]["lidc_features"], ROOT / "data/lidc_circle_r21_hu.csv")
         self.assertEqual(paths["training"]["lndb_features"], ROOT / "data/lndb_circle_r11_hu.csv")
 
@@ -198,19 +199,20 @@ class BinWidthTests(unittest.TestCase):
                 "outputs": {"features": root},
             }
             paths["radiomics"]["segmentation_3d"] = ROOT / "configs/radiomics_segmentation_3d.yaml"
+            paths["radiomics"]["sphere_3d"] = ROOT / "configs/radiomics_sphere_3d.yaml"
             scan = SimpleNamespace(to_volume=lambda verbose: sitk.GetArrayFromImage(image).transpose(1, 2, 0),
                                    pixel_spacing=0.8, slice_spacing=2.5, cluster_annotations=lambda verbose: [[]])
             slice_image = image[:, :, 1:2]
             slice_mask = sitk.Cast(slice_image == 0, sitk.sitkUInt8)
             for module, main, dataset in (("LIDCfeatureExtraction", extract_lidc, "lidc"),
                                           ("LNDBfeatureExtraction", extract_lndb, "lndb")):
-                for roi, dimension in (("circle", 2), ("segmentation", 2), ("segmentation", 3)):
+                for roi, dimension in (("circle", 2), ("sphere", 3), ("segmentation", 2), ("segmentation", 3)):
                     for width, custom_output in ((None, False), (10, False), (0.25, False), (10, True)):
                         args = [module, "--roi", roi, "--radius", "6", "--dimension", str(dimension)]
                         if width is not None:
                             args += ["--bin-width", str(width)]
                         prefix = "lndb_ge3" if dataset == "lndb" and roi == "segmentation" else dataset
-                        roi_name = "circle_r6" if roi == "circle" else f"segmentation_{dimension}d_c50"
+                        roi_name = f"{roi}_r6" if roi in ("circle", "sphere") else f"segmentation_{dimension}d_c50"
                         suffix = f"_bw{width:g}" if width is not None else ""
                         output = root / f"{prefix}_{roi_name}{suffix}_hu.csv"
                         if custom_output:
@@ -237,7 +239,13 @@ class BinWidthTests(unittest.TestCase):
                             self.assertEqual(settings.get("bin_width"), width)
                             if dimension == 3:
                                 self.assertEqual(settings["dimension"], 3)
-                                self.assertEqual(settings["slice_selection"], "full_volume")
+                                if roi == "segmentation":
+                                    self.assertEqual(settings["slice_selection"], "full_volume")
+                                else:
+                                    self.assertEqual(settings["radius_mm"], 6)
+                                    self.assertNotIn("consensus", settings)
+                                    self.assertNotIn("shape", extracted.call_args.args[2].enabledFeatures)
+                                    self.assertNotIn("shape2D", extracted.call_args.args[2].enabledFeatures)
                                 self.assertNotIn("slice_index", pd.read_csv(output))
                                 self.assertEqual(extracted.call_args.args[0].GetSize(), image.GetSize())
                                 self.assertEqual(extracted.call_args.args[2].enabledImagetypes["LBP3D"]["binWidth"], 0.25)

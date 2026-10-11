@@ -1,4 +1,4 @@
-"""Fill the competition submission using a saved classifier."""
+"""Fill the competition submission using a saved classifier or rounded regressor."""
 import argparse
 from pathlib import Path
 import joblib
@@ -11,7 +11,7 @@ KEYS = ["LNDbID", "FindingID"]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True, help="Saved model.joblib from src/modeling.py.")
+    parser.add_argument("--model", type=Path, required=True, help="Saved model.joblib from src/modeling.py or src/regression.py.")
     parser.add_argument("--features", type=Path, default=ROOT / "data/lndb_test_circle_r11_hu.csv")
     parser.add_argument("--submission", type=Path, default=ROOT / "predictions.csv")
     parser.add_argument("--output", type=Path, default=ROOT / "predictions.csv")
@@ -28,6 +28,12 @@ def main():
 
     X = table[features].replace([np.inf, -np.inf], np.nan)
     predictions = model.predict(X) + saved.get("label_offset", 0)
+    if saved.get("target") == "target_regression_mean":
+        if __package__:
+            from .regression import to_classes
+        else:
+            from regression import to_classes
+        predictions = to_classes(predictions)
     predicted = table[KEYS].copy()
     predicted["prediction"] = predictions.astype(int)
 
