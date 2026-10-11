@@ -15,7 +15,7 @@ import SimpleITK as sitk
 from radiomics import featureextractor
 
 from LIDCfeatureExtraction import create_lidc_segmentation
-from LNDBfeatureExtraction import create_lndb_segmentation, load_reader_mask, reader_findings
+from LNDBfeatureExtraction import create_lndb_segmentation, load_reader_mask, match_nodules_to_masks, reader_findings
 from src.radiomics_extraction import (
     check_mask_geometry,
     combine_reader_masks,
@@ -23,6 +23,7 @@ from src.radiomics_extraction import (
     extract_features,
     file_checksum,
     largest_mask_slice,
+    load_paths,
     prepare_run,
 )
 
@@ -36,6 +37,34 @@ def make_image(values):
     return image
 
 
+class PathTests(unittest.TestCase):
+    def test_yaml_paths_expand_home_and_use_repository_root(self):
+        with TemporaryDirectory(dir="/tmp/opencode", prefix="paths-test-") as directory:
+            config = Path(directory) / "paths.yaml"
+            config.write_text("lndb:\n  gt: ~/Downloads/trainset_csv/trainNodules_gt.csv\n"
+                              "outputs:\n  features: data\n  models: /tmp/opencode/model outputs\n")
+            paths = load_paths(config)
+            self.assertEqual(paths["lndb"]["gt"], Path.home() / "Downloads/trainset_csv/trainNodules_gt.csv")
+            self.assertEqual(paths["outputs"]["features"], ROOT / "data")
+            self.assertEqual(paths["outputs"]["models"], Path("/tmp/opencode/model outputs"))
+
+    def test_default_yaml_preserves_current_inputs(self):
+        paths = load_paths()
+        self.assertEqual(paths["lidc"]["targets"], ROOT / "data/processed/lidc_nodule_targets.csv")
+        self.assertEqual(paths["lndb"]["segmentation_targets"], ROOT / "data/processed/lndb_ge3_nodule_targets.csv")
+        self.assertEqual(paths["radiomics"]["segmentation"], ROOT / "configs/radiomics_segmentation_2d.yaml")
+        self.assertEqual(paths["training"]["lidc_features"], ROOT / "data/lidc_circle_r21_hu.csv")
+        self.assertEqual(paths["training"]["lndb_features"], ROOT / "data/lndb_circle_r11_hu.csv")
+
+    def test_invalid_paths_are_rejected(self):
+        with TemporaryDirectory(dir="/tmp/opencode", prefix="bad-paths-test-") as directory:
+            config = Path(directory) / "paths.yaml"
+            for contents in ("", "[]", "lndb: data", "lndb:\n  gt:", "lndb:\n  gt: 3"):
+                config.write_text(contents)
+                with self.subTest(contents=contents), self.assertRaises(ValueError):
+                    load_paths(config)
+
+
 class ConsensusTests(unittest.TestCase):
     def test_half_includes_ties_and_one_reader(self):
         first = np.array([[[1, 0, 1, 0]]], dtype=bool)
@@ -46,6 +75,15 @@ class ConsensusTests(unittest.TestCase):
     def test_three_readers_require_two_votes(self):
         masks = [np.array([[[1, 1, 0]]]), np.array([[[1, 0, 1]]]), np.array([[[0, 0, 1]]])]
         np.testing.assert_array_equal(combine_reader_masks(iter(masks)), [[[1, 0, 1]]])
+
+    def test_configurable_consensus(self):
+        first = np.array([[[1, 0, 1]]])
+        second = np.array([[[0, 1, 1]]])
+        np.testing.assert_array_equal(combine_reader_masks([first, second], 0.75), [[[0, 0, 1]]])
+        np.testing.assert_array_equal(combine_reader_masks([first, second], 1), [[[0, 0, 1]]])
+        for level in (0, -0.5, 1.01, np.nan, np.inf):
+            with self.subTest(level=level), self.assertRaises(ValueError):
+                combine_reader_masks([first, second], level)
 
     def test_invalid_or_empty_masks_are_not_dropped(self):
         valid = np.ones((1, 2, 2), dtype=bool)
@@ -108,8 +146,9 @@ class SliceTests(unittest.TestCase):
 
 
 class ReaderAssociationTests(unittest.TestCase):
-    def test_lndb_uses_reader_labels_and_ignores_non_nodules(self):
-        nodule = {"FindingID": 99, "RadID": "1,2,3", "RadFinding": "4,8,7", "Nodule": "1,0,1"}
+    def test_lndb_uses_gt_labels_not_allnods_reader_ids(self):
+        nodule = {"FindingID": 99, "RadID": "4,5", "RadFinding": "1,1",
+                  "mask_RadID": "1,3", "mask_RadFindingID": "4,7"}
         self.assertEqual(reader_findings(nodule), [(1, 4), (3, 7)])
         values = np.zeros((3, 8, 9), dtype=np.uint8)
         values[1, 1:4, 2:6] = 4
@@ -120,15 +159,45 @@ class ReaderAssociationTests(unittest.TestCase):
         self.assertEqual(index, 1)
         self.assertEqual(int(sitk.GetArrayFromImage(mask).sum()), 12)
         with self.assertRaisesRegex(ValueError, "non-empty"):
-            create_lndb_segmentation(image, {**nodule, "RadFinding": "5,8,7"}, {1: first, 3: third})
+            create_lndb_segmentation(image, {**nodule, "mask_RadFindingID": "5,7"}, {1: first, 3: third})
 
     def test_lndb_rejects_bad_reader_lists(self):
-        valid = {"RadID": "1,2", "RadFinding": "3,4", "Nodule": "1,1"}
-        for changed in [{"RadFinding": "3"}, {"RadID": "1,1"}, {"RadID": "1,2.5"},
-                        {"RadID": np.nan}, {"Nodule": "0,0"}, {"Nodule": "1,2"}, {"RadFinding": "0,4"}]:
+        valid = {"mask_RadID": "1,2", "mask_RadFindingID": "3,4"}
+        for changed in [{"mask_RadFindingID": "3"}, {"mask_RadID": "1,1"}, {"mask_RadID": "1,2.5"},
+                        {"mask_RadID": np.nan}, {"mask_RadID": "0,2"}, {"mask_RadFindingID": "0,4"}]:
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 reader_findings({**valid, **changed})
-        self.assertEqual(reader_findings({"RadID": 1., "RadFinding": 2., "Nodule": 1.}), [(1, 2)])
+        self.assertEqual(reader_findings({"mask_RadID": 1., "mask_RadFindingID": 2.}), [(1, 2)])
+
+    def test_lndb_matches_location_size_and_labels_not_group_or_reader_ids(self):
+        gt = pd.DataFrame({"LNDbID": [68, 131, 311], "FindingID": [1, 1, 7], "Nodule": [1, 1, 1],
+                           "RadID": ["1,2", "1", "2"], "RadFindingID": ["1,1", "1", "1"],
+                           "x": [10., 40., 70.], "y": [20., 50., 80.], "z": [30., 60., 90.],
+                           "Volume": [125., 20., 25.]})
+        nodules = gt[["LNDbID", "x", "y", "z"]].copy()
+        nodules["FindingID"], nodules["RadID"] = [1, 1, 6], ["1,3", "4", "5,4"]
+        nodules["RadFinding"], nodules["Nodule"] = ["1,1", "1", "1,2"], ["1,1", "1", "1,0"]
+        nodules["DiamEq_Rad"] = 2 * np.cbrt(3 * gt["Volume"] / (4 * np.pi))
+        nodules["target_classification_mean"] = [2, 3, 4]
+        nodules.loc[2, "x"] += 1  # Averaging non-nodule annotations can shift the centre.
+        mapping = match_nodules_to_masks(nodules, gt)
+        self.assertEqual(mapping["FindingID"].tolist(), [1, 1, 6])
+        self.assertEqual(mapping["gt_FindingID"].tolist(), [1, 1, 7])
+        self.assertEqual(mapping["mask_RadID"].tolist(), ["1,2", "1", "2"])
+        self.assertEqual(mapping["match_distance_mm"].tolist(), [0., 0., 1.])
+        joined = nodules.merge(mapping, on=["LNDbID", "FindingID"], validate="one_to_one")
+        self.assertEqual(joined["target_classification_mean"].tolist(), [2, 3, 4])
+        for wrong in (gt.assign(x=999.), gt.assign(Volume=999.), gt.assign(RadFindingID="9")):
+            with self.assertRaisesRegex(ValueError, "found 0"):
+                match_nodules_to_masks(nodules, wrong)
+        # A matching centre alone is insufficient. Keep size and label checks.
+        nearby_wrong = gt.assign(Volume=999., FindingID=99)
+        self.assertEqual(len(match_nodules_to_masks(nodules, pd.concat([gt, nearby_wrong]))), 3)
+        with self.assertRaisesRegex(ValueError, "found 2"):
+            match_nodules_to_masks(nodules, pd.concat([gt, gt.assign(FindingID=99)]))
+        duplicate = pd.concat([nodules, nodules.iloc[[0]].assign(FindingID=99)])
+        with self.assertRaisesRegex(ValueError, "same _gt nodule"):
+            match_nodules_to_masks(duplicate, gt)
 
     def test_reader_zip_is_unchanged(self):
         with TemporaryDirectory(dir="/tmp/opencode", prefix="mask-zip-test-") as directory:
@@ -154,8 +223,9 @@ class ReaderAssociationTests(unittest.TestCase):
         combined = np.zeros((3, 4, 2), dtype=bool)
         combined[:, :, 1] = True
         bbox = (slice(2, 5), slice(3, 7), slice(1, 3))
-        with patch("LIDCfeatureExtraction.consensus", return_value=(combined, bbox, [combined])):
-            _, mask, index = create_lidc_segmentation(image, cluster, saved)
+        with patch("LIDCfeatureExtraction.consensus", return_value=(combined, bbox, [combined])) as mocked:
+            _, mask, index = create_lidc_segmentation(image, cluster, saved, 0.75)
+            mocked.assert_called_once_with(cluster, clevel=0.75)
             self.assertEqual(index, 2)
             expected = np.zeros((1, 8, 9), dtype=np.uint8)
             expected[0, 2:5, 3:7] = 1
@@ -180,6 +250,8 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(settings["slice_selection"], "largest_mask_area")
             self.assertIsNone(settings["radius_mm"])
             self.assertEqual(prepare_run(output, config, 99, False, [source], roi="segmentation"), progress)
+            with self.assertRaises(ValueError):
+                prepare_run(output, config, None, False, [source], roi="segmentation", consensus_level=0.75)
             with self.assertRaises(ValueError):
                 prepare_run(output, config, 6, False, [source])
             source.write_bytes(b"changed mask source")

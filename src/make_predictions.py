@@ -18,6 +18,8 @@ def main():
     args = parser.parse_args()
 
     saved = joblib.load(args.model)
+    if saved.get("target") == "target_binary_mean":
+        raise ValueError("Competition submissions require a five-class model.")
     model = saved["model"]
     features = saved["features"]
     table = pd.read_csv(args.features)

@@ -9,7 +9,8 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from src.modeling import MIN_SAMPLES_GRID, TARGET, lndb_cv, load_data, make_model, tune_rf
+from src.modeling import MIN_SAMPLES_GRID, TARGET, fit_model, lndb_cv, load_data, make_model, metrics, tune_rf
+from src.make_predictions import main as make_submission
 
 
 class RFTuningTests(unittest.TestCase):
@@ -89,7 +90,9 @@ class PopulationTests(unittest.TestCase):
                                   "diagnostics_Image_Mean": [1., 2., 3.], TARGET: [5, 5, 5], "fold": [99, 99, 99]})
             path = root / "features.csv"
             table.to_csv(path, index=False)
-            with patch("src.modeling.ROOT", root):
+            locations = {"lndb": {"targets": processed / "lndb_nodule_targets.csv",
+                                   "folds": processed / "lndb_patient_folds.csv"}}
+            with patch("src.modeling.load_paths", return_value=locations):
                 full, features = load_data(path, "lndb")
                 selected, _ = load_data(path, "lndb", selected_path)
                 self.assertEqual(len(full), 3)
@@ -114,8 +117,76 @@ class PopulationTests(unittest.TestCase):
                                   "original_firstorder_Mean": [1., 2., 2.]})
             path = root / "features.csv"
             table.to_csv(path, index=False)
+            locations = {"lndb": {"targets": targets_path, "folds": root / "unused_folds.csv"}}
             with self.assertRaisesRegex(ValueError, "feature rows must have unique"):
-                load_data(path, "lndb", targets_path)
+                load_data(path, "lndb", targets_path, locations)
+
+
+class BinaryTests(unittest.TestCase):
+    def test_binary_model_cannot_fill_competition_submission(self):
+        with patch("sys.argv", ["make_predictions.py", "--model", "unused.joblib"]), \
+                patch("src.make_predictions.joblib.load", return_value={"target": "target_binary_mean"}):
+            with self.assertRaisesRegex(ValueError, "five-class model"):
+                make_submission()
+
+    def test_saved_binary_targets_select_population_and_preserve_folds(self):
+        with TemporaryDirectory(prefix="binary-population-", dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            targets = pd.DataFrame({"LNDbID": [1, 2, 3, 4], "NoduleID": [1, 1, 1, 1],
+                                    TARGET: [3, 3, 3, 4], "target_binary_mean": [0, np.nan, 1, 1]})
+            targets.to_csv(root / "targets.csv", index=False)
+            pd.DataFrame({"LNDbID": [1, 2, 3, 4], "fold": [5, 2, 3, 1]}).to_csv(root / "folds.csv", index=False)
+            table = pd.DataFrame({"LNDbID": [1, 2, 3, 4], "FindingID": [1, 1, 1, 1],
+                                  "original_firstorder_Mean": [10., 20., 30., 40.],
+                                  "original_shape2D_PixelSurface": [1., 2., 3., 4.],
+                                  "target_binary_mean": [1, 1, 0, 0], "fold": [99, 99, 99, 99]})
+            path = root / "features.csv"
+            table.to_csv(path, index=False)
+            locations = {"lndb": {"targets": root / "targets.csv", "folds": root / "folds.csv"}}
+            data, features = load_data(path, "lndb", paths=locations, binary=True)
+            self.assertEqual(data["LNDbID"].tolist(), [1, 3, 4])
+            self.assertEqual(data["target_binary_mean"].tolist(), [0, 1, 1])
+            self.assertEqual(data["fold"].tolist(), [5, 3, 1])
+            self.assertEqual(features, ["original_firstorder_Mean", "original_shape2D_PixelSurface"])
+            # Missing features are permitted only for the excluded, undefined target.
+            table[table["LNDbID"] != 2].to_csv(path, index=False)
+            self.assertEqual(len(load_data(path, "lndb", paths=locations, binary=True)[0]), 3)
+            table[table["LNDbID"] == 1].to_csv(path, index=False)
+            with self.assertRaisesRegex(ValueError, "all 3 training nodules"):
+                load_data(path, "lndb", paths=locations, binary=True)
+
+    def test_binary_metrics_and_rf_defaults(self):
+        score = metrics([0, 0, 1, 1], [0, 1, 1, 1], binary=True)
+        self.assertAlmostEqual(score["balanced_accuracy"], 0.75)
+        self.assertAlmostEqual(score["macro_f1"], (2 / 3 + 0.8) / 2)
+        self.assertAlmostEqual(score["mae"], 0.25)
+        five_class = make_model("balanced").named_steps["randomforestclassifier"]
+        binary = make_model("balanced", binary=True).named_steps["randomforestclassifier"]
+        self.assertEqual(five_class.get_params(), binary.get_params())
+
+    def test_binary_xgboost_keeps_class_weights_with_zero_label_offset(self):
+        model = make_model("balanced", model_kind="xgboost", binary=True)
+        classifier = model.named_steps["xgbclassifier"]
+        self.assertEqual(classifier.objective, "binary:logistic")
+        self.assertEqual(classifier.eval_metric, "logloss")
+        X = pd.DataFrame({"original_firstorder_Mean": [0., 0., 0., 1.]})
+        y = pd.Series([0, 0, 0, 1])
+        with patch.object(model, "fit", return_value=model) as fitted:
+            fit_model(model, X, y, "balanced", 0)
+        np.testing.assert_array_equal(fitted.call_args.args[1], y)
+        np.testing.assert_allclose(fitted.call_args.kwargs["xgbclassifier__sample_weight"], [2/3, 2/3, 2/3, 2])
+
+    def test_binary_rf_tuning_uses_binary_labels_and_target(self):
+        train = pd.DataFrame({"fold": np.repeat([1, 2, 4, 5], 4), TARGET: [5] * 16,
+                              "target_binary_mean": np.tile([0, 0, 1, 1], 4),
+                              "original_firstorder_Mean": np.tile([0., 0., 1., 1.], 4)})
+        grid = {"randomforestclassifier__min_samples_leaf": [1], "randomforestclassifier__min_samples_split": [2]}
+        with TemporaryDirectory(prefix="binary-tuning-", dir="/tmp/opencode") as directory:
+            with patch("src.modeling.MIN_SAMPLES_GRID", grid), contextlib.redirect_stdout(io.StringIO()):
+                search = tune_rf(make_model("balanced", binary=True), train, ["original_firstorder_Mean"],
+                                 0, Path(directory), "test", binary=True)
+            self.assertEqual(search.best_score_, 1.)
+            np.testing.assert_array_equal(search.best_estimator_.classes_, [0, 1])
 
 
 if __name__ == "__main__":

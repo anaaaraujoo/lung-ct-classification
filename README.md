@@ -41,64 +41,64 @@ uv export --format requirements.txt --no-hashes -o requirements.txt
 
 ## Usage
 
-### 2D radiomics from nodule segmentations
+### File locations
 
-This is a separate malignancy experiment, not an automatic segmentation model.
-The circle extraction remains the default and competition outputs are not replaced.
+Edit **`configs/paths.yaml`** to set input paths and output folders for both
+extractors and training. Relative paths start at the repository root.
+Use `--paths another.yaml` to select another paths file.
+Existing command-line path arguments override the YAML.
 
-The scripts use the cleaned LIDC targets (2,637 nodules) and the saved LNDb
-segmented-nodule targets (622 nodules). LNDb's diameter value of 3 is a sentinel
-for point-only findings, already excluded from `lndb_ge3_nodule_targets.csv`.
+**Exception:** LIDC DICOM files remain configured in `~/.pylidcrc`, read by
+`pylidc`. We do not change that file. Radiomics settings are in
+`configs/radiomics_circle_2d.yaml` and `configs/radiomics_segmentation_2d.yaml`.
 
-LIDC reader contours are loaded through `pylidc` and checked against the saved
-scan IDs, reader indices and centroids. LNDb uses `allNods.csv` to associate
-each grouped finding with its reader-specific label in `masks.zip`.
-Only readers who marked the finding as a nodule participate in the consensus.
-Missing reader masks are errors, not silently removed from the denominator.
+### LNDb masks: which CSV does what?
 
-Masks are combined at **at least 50% agreement**, including ties. With two
-readers, this is their union. Features are extracted from the axial slice with
-the largest consensus-mask area, choosing the first slice in an area tie.
-The selected original `slice_index` is saved for inspection, not used by the model.
+| File | Used for |
+|---|---|
+| `allNods.csv` | The nodule groups used by our saved malignancy targets |
+| `trainNodules_gt.csv` | Mask filenames (`RadID`) and labels inside masks (`RadFindingID`) |
 
-`configs/radiomics_segmentation_2d.yaml` retains the existing image filters,
-0.7 × 0.7 mm in-plane spacing, B-spline CT interpolation, nearest-neighbour mask
-interpolation and 25 HU bins. It adds `shape2D`, without LoG, HU clipping or
-intensity normalization.
+**Their grouped `FindingID` values can differ.** We match nodules using the
+same CT, centres within 3 mm, matching equivalent diameter and matching individual
+finding labels. Missing or ambiguous matches stop extraction.
 
-Extract both datasets from the repository root:
+Example: CT 28, `allNods` finding **6** matches `_gt` finding **7**. We load
+the masks listed in `_gt` row 7 and save features with ID **6**, preserving its target.
+The correspondence is saved as `mask_mapping.csv` in the output's `.scans` folder.
+
+### Extract segmentation features
+
+Use the supplied reader masks, combine them, and extract features from the axial
+slice with the largest mask area. LIDC masks come from `pylidc` reader contours.
 
 ```bash
-uv run python LIDCfeatureExtraction.py --roi segmentation
-uv run python LNDBfeatureExtraction.py --roi segmentation
+uv run python LIDCfeatureExtraction.py --roi segmentation --consensus 0.5
+uv run python LNDBfeatureExtraction.py --roi segmentation --consensus 0.5
 ```
 
-LNDb defaults to `~/Downloads/LNDb`, containing the CTs, `allNods.csv` and
-`masks.zip`. Override with `--data-dir`, `--findings` or `--masks` if needed.
-LIDC uses the existing `pylidc` DICOM configuration. For a small trial, use
-`--limit-scans 1 --output /tmp/opencode/lidc_segmentation_trial.csv`, or the
-equivalent LNDb command with a different output path.
+Consensus: `0.5` = 50%, `0.75` = 75%, `1` = all readers. At 50%, two readers
+produce their union. Missing masks are errors, not dropped readers.
 
-Outputs are `data/lidc_segmentation_2d_hu.csv` and
-`data/lndb_ge3_segmentation_2d_hu.csv`. Each scan has a checkpoint and an error
-CSV in the corresponding `.scans` directory. Repeating the command retries
-failed nodules and skips successful ones. Changed settings, source tables,
-mask archive or extraction code require a different output path.
-CTs and masks are read one scan at a time, preserving the raw files.
+At 50%, the default outputs are `data/lidc_segmentation_2d_c50_hu.csv` and
+`data/lndb_ge3_segmentation_2d_c50_hu.csv`. Rerun to resume and retry failures.
+Changed code, inputs or settings require another `--output`. For a small trial,
+add `--limit-scans 1 --output /tmp/opencode/trial.csv`.
 
-After **both extractions are complete**, train the same 500-tree weighted RF:
+### Train and compare
+
+After extraction, train the 500-tree weighted RF:
 
 ```bash
 uv run python src/modeling.py \
-  --lidc data/lidc_segmentation_2d_hu.csv \
-  --lndb data/lndb_ge3_segmentation_2d_hu.csv \
+  --lidc data/lidc_segmentation_2d_c50_hu.csv \
+  --lndb data/lndb_ge3_segmentation_2d_c50_hu.csv \
   --lndb-targets data/processed/lndb_ge3_nodule_targets.csv \
   --class-weight balanced \
-  --output models/rf_segmentation_2d_balanced
+  --output models/rf_segmentation_2d_c50_balanced
 ```
 
-Compare with the existing circle features at radius values 11/6, selecting
-the **same 622 LNDb nodules** without repeating their extraction:
+Compare with circles at radius values 11/6 on the same LNDb population:
 
 ```bash
 uv run python src/modeling.py \
@@ -109,19 +109,12 @@ uv run python src/modeling.py \
   --output models/rf_circle_r11_r6_ge3_balanced
 ```
 
-An explicit target table selects the population from a larger feature CSV.
-Missing features for any selected nodule stop training. If a smaller population
-is deliberately chosen after inspecting extraction failures, supply identical
-`--lidc-targets` and `--lndb-targets` tables to **both** comparisons.
+The segmentation population is 2,637 LIDC and 622 LNDb nodules. Missing features
+stop training. Any deliberate exclusions must use the same explicit target tables
+in both comparisons. Targets, saved patient folds and competition outputs remain
+unchanged. Validation uses LNDb folds, with all LIDC in training only.
 
-Both runs predict `target_classification_mean` (classes 1–5), using the saved
-LNDb patient folds with all LIDC in training only. Imputation is fitted within
-each training fold. Ratings, reader IDs, coordinates and other metadata are
-excluded from the feature whitelist. Cross-fold duplicate CTs remain unchanged
-and still limit validation reliability. The mask and slice choice both change
-in this comparison, so it evaluates the complete segmentation workflow.
-
-Run the small automated tests:
+### Tests
 
 ```bash
 uv run python -m unittest discover -s tests -v

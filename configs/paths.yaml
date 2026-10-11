@@ -1,0 +1,29 @@
+# Relative paths start at the repository root.
+# .pylidcrc is separate
+
+lidc:
+  annotations: data/processed/lidc_annotations_clean.csv
+  targets: data/processed/lidc_nodule_targets.csv
+  folds: data/processed/lidc_patient_folds.csv
+
+lndb:
+  ct_dir: ~/Downloads/LNDb
+  findings: ~/Downloads/LNDb/allNods.csv
+  gt: ~/Downloads/trainset_csv/trainNodules_gt.csv
+  masks: ~/Downloads/LNDb/masks.zip
+  targets: data/processed/lndb_nodule_targets.csv
+  segmentation_targets: data/processed/lndb_ge3_nodule_targets.csv
+  folds: data/processed/lndb_patient_folds.csv
+
+radiomics:
+  circle: configs/radiomics_circle_2d.yaml
+  segmentation: configs/radiomics_segmentation_2d.yaml
+
+# Default training inputs. --lidc and --lndb override these.
+training:
+  lidc_features: data/lidc_circle_r21_hu.csv
+  lndb_features: data/lndb_circle_r11_hu.csv
+
+outputs:
+  features: data
+  models: models

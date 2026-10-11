@@ -8,6 +8,23 @@ import numpy as np
 import pandas as pd
 import radiomics
 import SimpleITK as sitk
+import yaml
+
+
+def load_paths(path=None):
+    """Read file locations, expanding ~ and resolving relative paths from the repo."""
+    root = Path(__file__).resolve().parents[1]
+    path = Path(path or root / "configs/paths.yaml").expanduser()
+    paths = yaml.safe_load(path.read_text())
+    if not isinstance(paths, dict) or not all(isinstance(section, dict) for section in paths.values()):
+        raise ValueError("Paths YAML must contain sections of named file locations.")
+    for section, locations in paths.items():
+        for name, value in locations.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{section}.{name} must contain a non-empty path.")
+            location = Path(value).expanduser()
+            locations[name] = location if location.is_absolute() else root / location
+    return paths
 
 
 def create_circle(image, center_xyz, radius_mm):
@@ -44,8 +61,15 @@ def check_mask_geometry(image, mask):
             raise ValueError(f"Mask and CT differ in {attribute[3:].lower()}.")
 
 
-def combine_reader_masks(masks):
-    """At least half of the associated nodule readers must include each voxel."""
+def validate_consensus(level):
+    if not np.isfinite(level) or not 0 < level <= 1:
+        raise ValueError("Consensus must be a finite fraction greater than 0 and at most 1.")
+    return level
+
+
+def combine_reader_masks(masks, consensus_level=0.5):
+    """Include voxels meeting the requested fraction of associated readers."""
+    validate_consensus(consensus_level)
     votes, count = None, 0
     for mask in masks:
         mask = np.asarray(mask)
@@ -60,9 +84,10 @@ def combine_reader_masks(masks):
     if count == 0:
         raise ValueError("No reader masks found for this nodule.")
     # With two readers, 50% includes voxels marked by either reader.
-    combined = (votes >= (count + 1) // 2).astype(np.uint8)
+    required = int(np.ceil(count * consensus_level))
+    combined = (votes >= required).astype(np.uint8)
     if not combined.any():
-        raise ValueError("The 50% consensus mask is empty.")
+        raise ValueError(f"The {100 * consensus_level:g}% consensus mask is empty.")
     return combined
 
 
@@ -98,7 +123,7 @@ def file_checksum(path):
     return digest.hexdigest()
 
 
-def prepare_run(output, config, radius_mm, clip, sources, roi="circle"):
+def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensus_level=0.5):
     """Resume only when settings, source tables and extraction code match."""
     if roi not in ("circle", "segmentation"):
         raise ValueError("ROI must be circle or segmentation.")
@@ -118,7 +143,8 @@ def prepare_run(output, config, radius_mm, clip, sources, roi="circle"):
         },
     }
     if roi == "segmentation":
-        settings.update(consensus=0.5, slice_selection="largest_mask_area")
+        validate_consensus(consensus_level)
+        settings.update(consensus=consensus_level, slice_selection="largest_mask_area")
     if settings_path.exists():
         if json.loads(settings_path.read_text()) != settings:
             raise ValueError("Settings or inputs changed. Choose a different --output file.")

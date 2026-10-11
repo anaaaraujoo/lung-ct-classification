@@ -17,16 +17,18 @@ from src.radiomics_extraction import (
     create_circle,
     extract_features,
     largest_mask_slice,
+    load_paths,
     prepare_run,
     save_csv,
     save_errors,
+    validate_consensus,
 )
 
 ROOT = Path(__file__).resolve().parent
 KEYS = ["patient_id", "series_uid", "nodule_id"]
 
 
-def create_lidc_segmentation(image, cluster, saved_annotations):
+def create_lidc_segmentation(image, cluster, saved_annotations, consensus_level=0.5):
     """Verify the saved reader association before reconstructing its contours."""
     saved = saved_annotations.sort_values("annotation_idx")
     if len(cluster) != len(saved) or saved["annotation_idx"].tolist() != list(range(len(cluster))):
@@ -38,7 +40,8 @@ def create_lidc_segmentation(image, cluster, saved_annotations):
         ):
             raise ValueError("Reader centroid or scan differs from the saved annotation.")
 
-    combined, bbox, reader_masks = consensus(cluster, clevel=0.5)
+    validate_consensus(consensus_level)
+    combined, bbox, reader_masks = consensus(cluster, clevel=consensus_level)
     if any(not mask.any() for mask in reader_masks):
         raise ValueError("A reader's nodule mask is empty.")
     # PyLIDC uses [row, column, slice], SimpleITK arrays use [slice, row, column].
@@ -51,7 +54,9 @@ def create_lidc_segmentation(image, cluster, saved_annotations):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--paths", type=Path, default=ROOT / "configs/paths.yaml", help="YAML with file locations.")
     parser.add_argument("--roi", choices=["circle", "segmentation"], default="circle")
+    parser.add_argument("--consensus", type=float, default=0.5, help="Required fraction of nodule readers, including ties. Default: 0.5.")
     parser.add_argument("--radius", type=float, default=21, help="Radius in mm. Default: full-training LIDC P99.")
     parser.add_argument("--clip", action="store_true", help="Clip HU to [-1000, 400].")
     parser.add_argument("--patient", help="Extract only this patient ID.")
@@ -59,11 +64,16 @@ def main():
     parser.add_argument("--config", type=Path, help="Default: configuration matching --roi.")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    args.config = args.config or ROOT / f"configs/radiomics_{args.roi}_2d.yaml"
+    args.paths = args.paths.expanduser().resolve()
+    paths = load_paths(args.paths)
+    validate_consensus(args.consensus)
+    if args.roi == "circle" and args.consensus != 0.5:
+        parser.error("--consensus applies only to --roi segmentation.")
+    args.config = args.config or paths["radiomics"][args.roi]
 
-    targets_path = ROOT / "data/processed/lidc_nodule_targets.csv"
-    folds_path = ROOT / "data/processed/lidc_patient_folds.csv"
-    annotations_path = ROOT / "data/processed/lidc_annotations_clean.csv"
+    targets_path = paths["lidc"]["targets"]
+    folds_path = paths["lidc"]["folds"]
+    annotations_path = paths["lidc"]["annotations"]
     nodules = pd.read_csv(targets_path).merge(
         pd.read_csv(folds_path), on="patient_id", how="left", validate="many_to_one"
     )
@@ -90,12 +100,12 @@ def main():
         raise ValueError("A nodule is missing its saved centroid.")
 
     intensity = "clipped" if args.clip else "hu"
-    roi_name = f"circle_r{args.radius:g}" if args.roi == "circle" else "segmentation_2d"
-    output = args.output or ROOT / f"data/lidc_{roi_name}_{intensity}.csv"
+    roi_name = f"circle_r{args.radius:g}" if args.roi == "circle" else f"segmentation_2d_c{100 * args.consensus:g}"
+    output = args.output or paths["outputs"]["features"] / f"lidc_{roi_name}_{intensity}.csv"
     directory = prepare_run(
         output, args.config, args.radius, args.clip,
-        [Path(__file__), targets_path, folds_path, annotations_path],
-        roi=args.roi,
+        [Path(__file__), args.paths, targets_path, folds_path, annotations_path],
+        roi=args.roi, consensus_level=args.consensus,
     )
     radiomics.setVerbosity(logging.ERROR)
     extractor = featureextractor.RadiomicsFeatureExtractor(str(args.config))
@@ -131,6 +141,7 @@ def main():
                     if args.roi == "segmentation":
                         image_slice, mask, row["slice_index"] = create_lidc_segmentation(
                             image, clusters[row["nodule_id"]], saved[saved["nodule_id"] == row["nodule_id"]],
+                            args.consensus,
                         )
                     else:
                         # PyLIDC indices are [row, column, slice], SimpleITK uses [x, y, z].

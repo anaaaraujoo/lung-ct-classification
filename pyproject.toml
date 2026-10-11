@@ -15,6 +15,7 @@ dependencies = [
     "pandas>=2.1.0",
     "pylidc==0.2.3",
     "pyradiomics==3.1.0",
+    "pyyaml>=6.0.3",
     "scikit-learn>=1.6.1,<1.7",
     "setuptools<81",
     "simpleitk>=2.5.6",
