@@ -14,8 +14,8 @@ import pandas as pd
 import SimpleITK as sitk
 from radiomics import featureextractor
 
-from LIDCfeatureExtraction import create_lidc_segmentation
-from LNDBfeatureExtraction import create_lndb_segmentation, load_reader_mask, match_nodules_to_masks, reader_findings
+from LIDCfeatureExtraction import create_lidc_segmentation, main as extract_lidc
+from LNDBfeatureExtraction import create_lndb_segmentation, load_reader_mask, main as extract_lndb, match_nodules_to_masks, reader_findings
 from src.radiomics_extraction import (
     check_mask_geometry,
     combine_reader_masks,
@@ -145,6 +145,110 @@ class SliceTests(unittest.TestCase):
         self.assertFalse(any(name.startswith("diagnostics_") or name.startswith("log-sigma") for name in features))
 
 
+class BinWidthTests(unittest.TestCase):
+    def test_override_changes_discretization_not_config_or_feature_names(self):
+        image = make_image(np.arange(4 * 8 * 9, dtype=np.int16).reshape(4, 8, 9) * 3)
+        mask = make_image(np.ones((4, 8, 9), dtype=np.uint8))
+        image, mask, _ = largest_mask_slice(image, mask)
+        for roi in ("circle", "segmentation"):
+            config = ROOT / f"configs/radiomics_{roi}_2d.yaml"
+            before = config.read_bytes()
+            baseline = featureextractor.RadiomicsFeatureExtractor(str(config))
+            override = featureextractor.RadiomicsFeatureExtractor(str(config), binWidth=10)
+            with self.subTest(roi=roi), contextlib.redirect_stderr(io.StringIO()):
+                original = extract_features(image, mask, baseline)
+                changed = extract_features(image, mask, override)
+                self.assertEqual(baseline.settings["binWidth"], 25)
+                self.assertEqual(override.settings["binWidth"], 10)
+                self.assertEqual(original.keys(), changed.keys())
+                self.assertNotEqual(original["original_firstorder_Entropy"], changed["original_firstorder_Entropy"])
+                self.assertEqual(config.read_bytes(), before)
+
+    def test_both_cli_overrides_names_checkpoints_and_resume(self):
+        with TemporaryDirectory(dir="/tmp/opencode", prefix="bin-width-cli-") as directory:
+            root = Path(directory)
+            image = make_image(np.zeros((3, 8, 9), dtype=np.int16))
+            center = image.TransformIndexToPhysicalPoint((4, 3, 1))
+            tables = {
+                "lidc_targets": pd.DataFrame({"patient_id": ["patient"], "series_uid": ["series"], "nodule_id": [0]}),
+                "lidc_folds": pd.DataFrame({"patient_id": ["patient"], "fold": [1]}),
+                "lidc_annotations": pd.DataFrame({"patient_id": ["patient"], "series_uid": ["series"],
+                                                  "nodule_id": [0], "centroid": ["[3 4 1]"]}),
+                "lndb_targets": pd.DataFrame({"LNDbID": [1], "NoduleID": [1]}),
+                "lndb_folds": pd.DataFrame({"LNDbID": [1], "fold": [1]}),
+                "findings": pd.DataFrame({"LNDbID": [1], "FindingID": [1], "x": [center[0]],
+                                          "y": [center[1]], "z": [center[2]], "RadID": [1],
+                                          "RadFinding": [1], "Nodule": [1],
+                                          "DiamEq_Rad": [2 * np.cbrt(3 * 125 / (4 * np.pi))]}),
+                "gt": pd.DataFrame({"LNDbID": [1], "FindingID": [1], "x": [center[0]],
+                                    "y": [center[1]], "z": [center[2]], "RadID": [1],
+                                    "RadFindingID": [1], "Nodule": [1], "Volume": [125]}),
+            }
+            for name, table in tables.items():
+                table.to_csv(root / f"{name}.csv", index=False)
+            (root / "masks.zip").write_bytes(b"mask source")
+            paths = {
+                "lidc": {name: root / f"lidc_{name}.csv" for name in ("targets", "folds", "annotations")},
+                "lndb": {"targets": root / "lndb_targets.csv", "segmentation_targets": root / "lndb_targets.csv",
+                         "folds": root / "lndb_folds.csv", "findings": root / "findings.csv",
+                         "gt": root / "gt.csv", "masks": root / "masks.zip", "ct_dir": root},
+                "radiomics": {roi: ROOT / f"configs/radiomics_{roi}_2d.yaml" for roi in ("circle", "segmentation")},
+                "outputs": {"features": root},
+            }
+            scan = SimpleNamespace(to_volume=lambda verbose: sitk.GetArrayFromImage(image).transpose(1, 2, 0),
+                                   pixel_spacing=0.8, slice_spacing=2.5, cluster_annotations=lambda verbose: [[]])
+            slice_image = image[:, :, 1:2]
+            slice_mask = sitk.Cast(slice_image == 0, sitk.sitkUInt8)
+            for module, main, dataset in (("LIDCfeatureExtraction", extract_lidc, "lidc"),
+                                          ("LNDBfeatureExtraction", extract_lndb, "lndb")):
+                for roi in ("circle", "segmentation"):
+                    for width, custom_output in ((None, False), (10, False), (0.25, False), (10, True)):
+                        args = [module, "--roi", roi, "--radius", "6"]
+                        if width is not None:
+                            args += ["--bin-width", str(width)]
+                        prefix = "lndb_ge3" if dataset == "lndb" and roi == "segmentation" else dataset
+                        roi_name = "circle_r6" if roi == "circle" else "segmentation_2d_c50"
+                        suffix = f"_bw{width:g}" if width is not None else ""
+                        output = root / f"{prefix}_{roi_name}{suffix}_hu.csv"
+                        if custom_output:
+                            output = root / f"{prefix}_{roi_name}_custom.csv"
+                            args += ["--output", str(output)]
+                        with self.subTest(dataset=dataset, roi=roi, width=width, custom_output=custom_output), \
+                                contextlib.ExitStack() as stack:
+                            stack.enter_context(patch("sys.argv", args))
+                            stack.enter_context(patch(f"{module}.load_paths", return_value=paths))
+                            extracted = stack.enter_context(patch(f"{module}.extract_features", side_effect=
+                                lambda image, mask, extractor, clip: {"original_firstorder_Entropy": extractor.settings["binWidth"]}))
+                            if dataset == "lidc":
+                                queried = stack.enter_context(patch(f"{module}.pl.query"))
+                                queried.return_value.filter.return_value.one.return_value = scan
+                                stack.enter_context(patch(f"{module}.create_lidc_segmentation", return_value=(slice_image, slice_mask, 1)))
+                            else:
+                                stack.enter_context(patch(f"{module}.load_scan", return_value=image))
+                                stack.enter_context(patch(f"{module}.load_reader_mask", return_value=image))
+                                stack.enter_context(patch(f"{module}.create_lndb_segmentation", return_value=(slice_image, slice_mask, 1)))
+                            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                            self.assertEqual(main(), 0)
+                            settings = json.loads((output.with_suffix(".scans") / "settings.json").read_text())
+                            self.assertEqual(settings.get("bin_width"), width)
+                            self.assertEqual(pd.read_csv(output)["original_firstorder_Entropy"].tolist(), [width if width is not None else 25])
+                            before = output.read_bytes()
+                            self.assertEqual(main(), 0)
+                            self.assertEqual(extracted.call_count, 1)
+                            self.assertEqual(output.read_bytes(), before)
+
+    def test_invalid_cli_widths_are_rejected_before_loading_inputs(self):
+        for main in (extract_lidc, extract_lndb):
+            for width in ("0", "-1", "nan", "inf", "-inf"):
+                with self.subTest(main=main.__module__, width=width), \
+                        patch("sys.argv", ["extract", f"--bin-width={width}"]), \
+                        patch(f"{main.__module__}.load_paths") as loaded, contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        main()
+                    self.assertEqual(error.exception.code, 2)
+                    loaded.assert_not_called()
+
+
 class ReaderAssociationTests(unittest.TestCase):
     def test_lndb_uses_gt_labels_not_allnods_reader_ids(self):
         nodule = {"FindingID": 99, "RadID": "4,5", "RadFinding": "1,1",
@@ -236,6 +340,22 @@ class ReaderAssociationTests(unittest.TestCase):
 
 
 class ResumeTests(unittest.TestCase):
+    def test_bin_width_overrides_are_part_of_checkpoint_settings(self):
+        with TemporaryDirectory(dir="/tmp/opencode", prefix="bin-width-resume-") as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text("setting:\n  binWidth: 25\n")
+            output = root / "features.csv"
+            progress = prepare_run(output, config, 6, False, [], bin_width=10)
+            self.assertEqual(json.loads((progress / "settings.json").read_text())["bin_width"], 10)
+            self.assertEqual(prepare_run(output, config, 6, False, [], bin_width=10), progress)
+            for width in (None, 25, 0.25):
+                with self.subTest(width=width), self.assertRaisesRegex(ValueError, "Settings or inputs changed"):
+                    prepare_run(output, config, 6, False, [], bin_width=width)
+            for width in (0, -1, np.nan, np.inf):
+                with self.subTest(width=width), self.assertRaisesRegex(ValueError, "positive finite"):
+                    prepare_run(output, config, 6, False, [], bin_width=width)
+
     def test_segmentation_settings_and_source_changes(self):
         with TemporaryDirectory(dir="/tmp/opencode", prefix="mask-resume-test-") as directory:
             directory = Path(directory)

@@ -123,12 +123,14 @@ def file_checksum(path):
     return digest.hexdigest()
 
 
-def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensus_level=0.5):
+def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensus_level=0.5, bin_width=None):
     """Resume only when settings, source tables and extraction code match."""
     if roi not in ("circle", "segmentation"):
         raise ValueError("ROI must be circle or segmentation.")
     if roi == "circle" and (radius_mm is None or radius_mm <= 0 or not np.isfinite(radius_mm)):
         raise ValueError("Radius must be a positive finite number.")
+    if bin_width is not None and (not np.isfinite(bin_width) or bin_width <= 0):
+        raise ValueError("Bin width must be a positive finite number.")
     directory = output.with_suffix(".scans")
     settings_path = directory / "settings.json"
     settings = {
@@ -145,6 +147,8 @@ def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensu
     if roi == "segmentation":
         validate_consensus(consensus_level)
         settings.update(consensus=consensus_level, slice_selection="largest_mask_area")
+    if bin_width is not None:
+        settings["bin_width"] = bin_width
     if settings_path.exists():
         if json.loads(settings_path.read_text()) != settings:
             raise ValueError("Settings or inputs changed. Choose a different --output file.")

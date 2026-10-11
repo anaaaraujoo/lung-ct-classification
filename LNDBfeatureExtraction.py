@@ -179,8 +179,11 @@ def main():
     parser.add_argument("--scan", type=int, help="Extract only this LNDbID.")
     parser.add_argument("--limit-scans", type=int, help="Limit the number of scans for a small run.")
     parser.add_argument("--config", type=Path, help="Default: configuration matching --roi.")
+    parser.add_argument("--bin-width", type=float, help="Override the YAML intensity bin width. Default: use the YAML value.")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.bin_width is not None and (not np.isfinite(args.bin_width) or args.bin_width <= 0):
+        parser.error("--bin-width must be a positive finite number.")
     args.paths = args.paths.expanduser().resolve()
     paths = load_paths(args.paths)
     args.config = args.config or paths["radiomics"][args.roi]
@@ -237,13 +240,15 @@ def main():
 
     intensity = "clipped" if args.clip else "hu"
     roi_name = f"circle_r{args.radius:g}" if args.roi == "circle" else f"segmentation_2d_c{100 * args.consensus:g}"
-    output = args.output or paths["outputs"]["features"] / f"{dataset}_{roi_name}_{intensity}.csv"
+    bin_suffix = f"_bw{args.bin_width:g}" if args.bin_width is not None else ""
+    output = args.output or paths["outputs"]["features"] / f"{dataset}_{roi_name}{bin_suffix}_{intensity}.csv"
     directory = prepare_run(output, args.config, args.radius, args.clip, sources,
-                            roi=args.roi, consensus_level=args.consensus)
+                            roi=args.roi, consensus_level=args.consensus, bin_width=args.bin_width)
     if args.roi == "segmentation":
         save_csv(mapping, directory / "mask_mapping.csv")
     radiomics.setVerbosity(logging.ERROR)
-    extractor = featureextractor.RadiomicsFeatureExtractor(str(args.config))
+    overrides = {"binWidth": args.bin_width} if args.bin_width is not None else {}
+    extractor = featureextractor.RadiomicsFeatureExtractor(str(args.config), **overrides)
     for lndb_id, scan_nodules in nodules.groupby("LNDbID", sort=False):
         extract_features_for_series(
             int(lndb_id), scan_nodules, args.data_dir, extractor, args.radius, args.clip, directory,
