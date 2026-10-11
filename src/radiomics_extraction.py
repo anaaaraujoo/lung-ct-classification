@@ -1,4 +1,4 @@
-"""Shared 2D radiomics extraction and per-scan progress saving."""
+"""Shared radiomics extraction and per-scan progress saving."""
 
 import hashlib
 import json
@@ -105,6 +105,19 @@ def largest_mask_slice(image, mask):
     return image[:, :, index:index + 1], mask[:, :, index:index + 1], index
 
 
+def segmentation_roi(image, mask, dimension=2):
+    """Select the largest axial slice or retain the full consensus volume."""
+    if dimension == 2:
+        return largest_mask_slice(image, mask)
+    if dimension != 3:
+        raise ValueError("Segmentation dimension must be 2 or 3.")
+    check_mask_geometry(image, mask)
+    values = sitk.GetArrayViewFromImage(mask)
+    if not np.isin(values, [0, 1]).all() or not values.any():
+        raise ValueError("The nodule mask must be non-empty and binary.")
+    return image, mask, None
+
+
 def extract_features(image, mask, extractor, clip=False):
     # Preserve fractional HU values when resampling.
     image = sitk.Cast(image, sitk.sitkFloat32)
@@ -123,10 +136,12 @@ def file_checksum(path):
     return digest.hexdigest()
 
 
-def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensus_level=0.5, bin_width=None):
+def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensus_level=0.5, bin_width=None, dimension=2):
     """Resume only when settings, source tables and extraction code match."""
     if roi not in ("circle", "segmentation"):
         raise ValueError("ROI must be circle or segmentation.")
+    if dimension not in (2, 3) or (dimension == 3 and roi != "segmentation"):
+        raise ValueError("Dimension must be 2, or 3 for segmentation.")
     if roi == "circle" and (radius_mm is None or radius_mm <= 0 or not np.isfinite(radius_mm)):
         raise ValueError("Radius must be a positive finite number.")
     if bin_width is not None and (not np.isfinite(bin_width) or bin_width <= 0):
@@ -146,7 +161,10 @@ def prepare_run(output, config, radius_mm, clip, sources, roi="circle", consensu
     }
     if roi == "segmentation":
         validate_consensus(consensus_level)
-        settings.update(consensus=consensus_level, slice_selection="largest_mask_area")
+        settings.update(consensus=consensus_level,
+                        slice_selection="largest_mask_area" if dimension == 2 else "full_volume")
+    if dimension == 3:
+        settings["dimension"] = dimension
     if bin_width is not None:
         settings["bin_width"] = bin_width
     if settings_path.exists():

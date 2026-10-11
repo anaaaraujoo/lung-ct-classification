@@ -1,4 +1,4 @@
-"""Extract LNDb circle radiomics or 2D radiomics from existing reader masks."""
+"""Extract LNDb circle radiomics or 2D/3D radiomics from existing reader masks."""
 
 import argparse
 import logging
@@ -18,11 +18,11 @@ from src.radiomics_extraction import (
     check_mask_geometry,
     create_circle,
     extract_features,
-    largest_mask_slice,
     load_paths,
     prepare_run,
     save_csv,
     save_errors,
+    segmentation_roi,
     validate_consensus,
 )
 
@@ -110,7 +110,7 @@ def load_reader_mask(archive_path, lndb_id, reader_id):
         return sitk.ReadImage(str(Path(temporary) / "masks" / f"{name}.mhd"))
 
 
-def create_lndb_segmentation(image, nodule, masks, consensus_level=0.5):
+def create_lndb_segmentation(image, nodule, masks, consensus_level=0.5, dimension=2):
     """Select reader-specific labels, not the grouped FindingID."""
     readers = reader_findings(nodule)
     for reader_id, _ in readers:
@@ -120,11 +120,11 @@ def create_lndb_segmentation(image, nodule, masks, consensus_level=0.5):
     values = combine_reader_masks(reader_masks, consensus_level)
     mask = sitk.GetImageFromArray(values)
     mask.CopyInformation(image)
-    return largest_mask_slice(image, mask)
+    return segmentation_roi(image, mask, dimension)
 
 
 def extract_features_for_series(lndb_id, nodules, data_dir, extractor, radius_mm, clip, directory,
-                                roi="circle", masks_path=None, consensus_level=0.5):
+                                roi="circle", masks_path=None, consensus_level=0.5, dimension=2):
     scan_name = f"LNDb-{lndb_id:04d}"
     checkpoint = directory / f"{scan_name}.features.csv"
     rows = pd.read_csv(checkpoint).to_dict("records") if checkpoint.exists() else []
@@ -134,7 +134,7 @@ def extract_features_for_series(lndb_id, nodules, data_dir, extractor, radius_mm
         print(f"{scan_name}: already extracted")
         return
 
-    roi_name = f"circle_r{radius_mm:g}" if roi == "circle" else f"segmentation_2d_c{100 * consensus_level:g}"
+    roi_name = f"circle_r{radius_mm:g}" if roi == "circle" else f"segmentation_{dimension}d_c{100 * consensus_level:g}"
     print(f"{scan_name}: {len(pending)} nodules, {roi_name}", flush=True)
     errors = []
     masks = {}
@@ -150,11 +150,13 @@ def extract_features_for_series(lndb_id, nodules, data_dir, extractor, radius_mm
                     for reader_id, _ in reader_findings(nodule):
                         if reader_id not in masks:
                             masks[reader_id] = load_reader_mask(masks_path, lndb_id, reader_id)
-                    image_slice, mask, row["slice_index"] = create_lndb_segmentation(image, nodule, masks, consensus_level)
+                    image_roi, mask, slice_index = create_lndb_segmentation(image, nodule, masks, consensus_level, dimension)
+                    if dimension == 2:
+                        row["slice_index"] = slice_index
                 else:
                     center = tuple(nodule[["x", "y", "z"]].astype(float))
-                    image_slice, mask = create_circle(image, center, radius_mm)
-                row.update(extract_features(image_slice, mask, extractor, clip))
+                    image_roi, mask = create_circle(image, center, radius_mm)
+                row.update(extract_features(image_roi, mask, extractor, clip))
                 rows.append(row)
             except Exception as exc:
                 errors.append({**row, "error": str(exc)})
@@ -169,6 +171,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--paths", type=Path, default=ROOT / "configs/paths.yaml", help="YAML with file locations.")
     parser.add_argument("--roi", choices=["circle", "segmentation"], default="circle")
+    parser.add_argument("--dimension", type=int, choices=[2, 3], default=2,
+                        help="Segmentation features from one axial slice (2) or the full volume (3). Default: 2.")
     parser.add_argument("--data-dir", type=Path, help="Override the YAML CT directory and default mask/findings locations.")
     parser.add_argument("--masks", type=Path, help="Override the YAML reader masks ZIP.")
     parser.add_argument("--findings", type=Path, help="Override the YAML allNods.csv.")
@@ -184,9 +188,16 @@ def main():
     args = parser.parse_args()
     if args.bin_width is not None and (not np.isfinite(args.bin_width) or args.bin_width <= 0):
         parser.error("--bin-width must be a positive finite number.")
+    if args.dimension == 3 and args.roi != "segmentation":
+        parser.error("--dimension 3 requires --roi segmentation.")
     args.paths = args.paths.expanduser().resolve()
     paths = load_paths(args.paths)
-    args.config = args.config or paths["radiomics"][args.roi]
+    config_name = "segmentation_3d" if args.dimension == 3 else args.roi
+    args.config = args.config or paths["radiomics"][config_name]
+    overrides = {"binWidth": args.bin_width} if args.bin_width is not None else {}
+    extractor = featureextractor.RadiomicsFeatureExtractor(str(args.config), **overrides)
+    if args.dimension == 3 and extractor.settings.get("force2D", False):
+        parser.error("3D extraction requires a config with force2D: false.")
     if args.data_dir:
         args.masks = args.masks or args.data_dir / "masks.zip"
         args.findings = args.findings or args.data_dir / "allNods.csv"
@@ -239,20 +250,18 @@ def main():
         raise ValueError("No nodules match the requested scans.")
 
     intensity = "clipped" if args.clip else "hu"
-    roi_name = f"circle_r{args.radius:g}" if args.roi == "circle" else f"segmentation_2d_c{100 * args.consensus:g}"
+    roi_name = f"circle_r{args.radius:g}" if args.roi == "circle" else f"segmentation_{args.dimension}d_c{100 * args.consensus:g}"
     bin_suffix = f"_bw{args.bin_width:g}" if args.bin_width is not None else ""
     output = args.output or paths["outputs"]["features"] / f"{dataset}_{roi_name}{bin_suffix}_{intensity}.csv"
     directory = prepare_run(output, args.config, args.radius, args.clip, sources,
-                            roi=args.roi, consensus_level=args.consensus, bin_width=args.bin_width)
+                            roi=args.roi, consensus_level=args.consensus, bin_width=args.bin_width, dimension=args.dimension)
     if args.roi == "segmentation":
         save_csv(mapping, directory / "mask_mapping.csv")
     radiomics.setVerbosity(logging.ERROR)
-    overrides = {"binWidth": args.bin_width} if args.bin_width is not None else {}
-    extractor = featureextractor.RadiomicsFeatureExtractor(str(args.config), **overrides)
     for lndb_id, scan_nodules in nodules.groupby("LNDbID", sort=False):
         extract_features_for_series(
             int(lndb_id), scan_nodules, args.data_dir, extractor, args.radius, args.clip, directory,
-            roi=args.roi, masks_path=args.masks, consensus_level=args.consensus,
+            roi=args.roi, masks_path=args.masks, consensus_level=args.consensus, dimension=args.dimension,
         )
     return int(combine_results(directory, nodules, KEYS, output) > 0)
 

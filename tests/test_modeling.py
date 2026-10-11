@@ -70,6 +70,21 @@ class RFTuningTests(unittest.TestCase):
 
 
 class PopulationTests(unittest.TestCase):
+    def test_3d_shape_log_and_lbp_are_features_not_metadata(self):
+        with TemporaryDirectory(prefix="volume-population-", dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            pd.DataFrame({"LNDbID": [1], "NoduleID": [1], TARGET: [4]}).to_csv(root / "targets.csv", index=False)
+            pd.DataFrame({"LNDbID": [1], "fold": [3]}).to_csv(root / "folds.csv", index=False)
+            columns = ["original_shape_MeshVolume", "log-sigma-1-0-mm-3D_glcm_Contrast", "lbp-3D-m1_firstorder_Mean"]
+            table = pd.DataFrame({"LNDbID": [1], "FindingID": [1], "mask_RadID": [99], "gt_FindingID": [7],
+                                  "diagnostics_Image_Mean": [500], **{name: [2.] for name in columns}})
+            table.to_csv(root / "features.csv", index=False)
+            paths = {"lndb": {"targets": root / "targets.csv", "folds": root / "folds.csv"}}
+            data, features = load_data(root / "features.csv", "lndb", paths=paths)
+            self.assertEqual(features, columns)
+            self.assertEqual(data["fold"].tolist(), [3])
+            self.assertEqual(data[TARGET].tolist(), [4])
+
     def test_explicit_targets_select_same_nodules_from_larger_circle_table(self):
         with TemporaryDirectory(prefix="rf-population-test-", dir="/tmp/opencode") as directory:
             root = Path(directory)

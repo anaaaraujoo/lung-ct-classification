@@ -1,0 +1,34 @@
+setting:
+  label: 1
+  normalize: false
+  binWidth: 25
+  interpolator: sitkBSpline
+  resampledPixelSpacing: [0.7, 0.7, 0.7]
+# Keep ~10 mm of surrounding CT for LoG filtering: 15 voxels at 0.7 mm spacing.
+# https://github.com/AIM-Harvard/pyradiomics/blob/v3.1.0/examples/exampleSettings/exampleCT.yaml
+  padDistance: 15
+  force2D: false
+  distances: [1]
+  additionalInfo: false
+
+imageType:
+  Original: {}
+  Wavelet: {}
+  LoG:
+    sigma: [1.0, 2.0, 3.0, 4.0, 5.0]
+  Square: {}
+  SquareRoot: {}
+  Logarithm: {}
+  Exponential: {}
+  Gradient: {}
+  LBP3D:
+    binWidth: 0.25
+
+featureClass:
+  shape: []
+  firstorder: []
+  glcm: []
+  glrlm: []
+  glszm: []
+  gldm: []
+  ngtdm: []

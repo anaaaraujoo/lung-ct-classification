@@ -133,6 +133,7 @@ numpy==1.23.5
     #   scikit-learn
     #   scipy
     #   tifffile
+    #   trimesh
     #   xgboost
 nvidia-nccl-cu12==2.32.3 ; platform_machine != 'aarch64' and sys_platform == 'linux'
     # via xgboost
@@ -225,6 +226,7 @@ scikit-learn==1.6.1
 scipy==1.13.1 ; python_full_version < '3.10'
     # via
     #   imbalanced-learn
+    #   por-definir-ds
     #   pylidc
     #   scikit-image
     #   scikit-learn
@@ -232,6 +234,7 @@ scipy==1.13.1 ; python_full_version < '3.10'
 scipy==1.15.3 ; python_full_version >= '3.10'
     # via
     #   imbalanced-learn
+    #   por-definir-ds
     #   pylidc
     #   scikit-image
     #   scikit-learn
@@ -280,6 +283,10 @@ traitlets==5.16.1 ; python_full_version >= '3.10'
     #   jupyter-client
     #   jupyter-core
     #   matplotlib-inline
+trimesh==4.12.2 ; python_full_version < '3.10'
+    # via por-definir-ds
+trimesh==5.1.1 ; python_full_version >= '3.10'
+    # via por-definir-ds
 typing-extensions==4.16.0
     # via
     #   exceptiongroup

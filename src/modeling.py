@@ -26,7 +26,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "target_classification_mean"
-FEATURE_PATTERN = r"_(shape2D|firstorder|glcm|glrlm|glszm|gldm|ngtdm)_"
+FEATURE_PATTERN = r"_(shape|shape2D|firstorder|glcm|glrlm|glszm|gldm|ngtdm)_"
 MIN_SAMPLES_GRID = {
     "randomforestclassifier__min_samples_leaf": [1, 5, 10, 20],
     "randomforestclassifier__min_samples_split": [2, 10, 20, 40],

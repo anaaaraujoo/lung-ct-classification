@@ -18,6 +18,7 @@ lndb:
 radiomics:
   circle: configs/radiomics_circle_2d.yaml
   segmentation: configs/radiomics_segmentation_2d.yaml
+  segmentation_3d: configs/radiomics_segmentation_3d.yaml
 
 # Default training inputs. --lidc and --lndb override these.
 training:

@@ -25,6 +25,7 @@ from src.radiomics_extraction import (
     largest_mask_slice,
     load_paths,
     prepare_run,
+    segmentation_roi,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,7 @@ class PathTests(unittest.TestCase):
         self.assertEqual(paths["lidc"]["targets"], ROOT / "data/processed/lidc_nodule_targets.csv")
         self.assertEqual(paths["lndb"]["segmentation_targets"], ROOT / "data/processed/lndb_ge3_nodule_targets.csv")
         self.assertEqual(paths["radiomics"]["segmentation"], ROOT / "configs/radiomics_segmentation_2d.yaml")
+        self.assertEqual(paths["radiomics"]["segmentation_3d"], ROOT / "configs/radiomics_segmentation_3d.yaml")
         self.assertEqual(paths["training"]["lidc_features"], ROOT / "data/lidc_circle_r21_hu.csv")
         self.assertEqual(paths["training"]["lndb_features"], ROOT / "data/lndb_circle_r11_hu.csv")
 
@@ -195,42 +197,50 @@ class BinWidthTests(unittest.TestCase):
                 "radiomics": {roi: ROOT / f"configs/radiomics_{roi}_2d.yaml" for roi in ("circle", "segmentation")},
                 "outputs": {"features": root},
             }
+            paths["radiomics"]["segmentation_3d"] = ROOT / "configs/radiomics_segmentation_3d.yaml"
             scan = SimpleNamespace(to_volume=lambda verbose: sitk.GetArrayFromImage(image).transpose(1, 2, 0),
                                    pixel_spacing=0.8, slice_spacing=2.5, cluster_annotations=lambda verbose: [[]])
             slice_image = image[:, :, 1:2]
             slice_mask = sitk.Cast(slice_image == 0, sitk.sitkUInt8)
             for module, main, dataset in (("LIDCfeatureExtraction", extract_lidc, "lidc"),
                                           ("LNDBfeatureExtraction", extract_lndb, "lndb")):
-                for roi in ("circle", "segmentation"):
+                for roi, dimension in (("circle", 2), ("segmentation", 2), ("segmentation", 3)):
                     for width, custom_output in ((None, False), (10, False), (0.25, False), (10, True)):
-                        args = [module, "--roi", roi, "--radius", "6"]
+                        args = [module, "--roi", roi, "--radius", "6", "--dimension", str(dimension)]
                         if width is not None:
                             args += ["--bin-width", str(width)]
                         prefix = "lndb_ge3" if dataset == "lndb" and roi == "segmentation" else dataset
-                        roi_name = "circle_r6" if roi == "circle" else "segmentation_2d_c50"
+                        roi_name = "circle_r6" if roi == "circle" else f"segmentation_{dimension}d_c50"
                         suffix = f"_bw{width:g}" if width is not None else ""
                         output = root / f"{prefix}_{roi_name}{suffix}_hu.csv"
                         if custom_output:
                             output = root / f"{prefix}_{roi_name}_custom.csv"
                             args += ["--output", str(output)]
-                        with self.subTest(dataset=dataset, roi=roi, width=width, custom_output=custom_output), \
+                        with self.subTest(dataset=dataset, roi=roi, dimension=dimension, width=width, custom_output=custom_output), \
                                 contextlib.ExitStack() as stack:
                             stack.enter_context(patch("sys.argv", args))
                             stack.enter_context(patch(f"{module}.load_paths", return_value=paths))
+                            selected = (slice_image, slice_mask, 1) if dimension == 2 else (image, sitk.Cast(image == 0, sitk.sitkUInt8), None)
                             extracted = stack.enter_context(patch(f"{module}.extract_features", side_effect=
                                 lambda image, mask, extractor, clip: {"original_firstorder_Entropy": extractor.settings["binWidth"]}))
                             if dataset == "lidc":
                                 queried = stack.enter_context(patch(f"{module}.pl.query"))
                                 queried.return_value.filter.return_value.one.return_value = scan
-                                stack.enter_context(patch(f"{module}.create_lidc_segmentation", return_value=(slice_image, slice_mask, 1)))
+                                stack.enter_context(patch(f"{module}.create_lidc_segmentation", return_value=selected))
                             else:
                                 stack.enter_context(patch(f"{module}.load_scan", return_value=image))
                                 stack.enter_context(patch(f"{module}.load_reader_mask", return_value=image))
-                                stack.enter_context(patch(f"{module}.create_lndb_segmentation", return_value=(slice_image, slice_mask, 1)))
+                                stack.enter_context(patch(f"{module}.create_lndb_segmentation", return_value=selected))
                             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                             self.assertEqual(main(), 0)
                             settings = json.loads((output.with_suffix(".scans") / "settings.json").read_text())
                             self.assertEqual(settings.get("bin_width"), width)
+                            if dimension == 3:
+                                self.assertEqual(settings["dimension"], 3)
+                                self.assertEqual(settings["slice_selection"], "full_volume")
+                                self.assertNotIn("slice_index", pd.read_csv(output))
+                                self.assertEqual(extracted.call_args.args[0].GetSize(), image.GetSize())
+                                self.assertEqual(extracted.call_args.args[2].enabledImagetypes["LBP3D"]["binWidth"], 0.25)
                             self.assertEqual(pd.read_csv(output)["original_firstorder_Entropy"].tolist(), [width if width is not None else 25])
                             before = output.read_bytes()
                             self.assertEqual(main(), 0)
@@ -248,6 +258,91 @@ class BinWidthTests(unittest.TestCase):
                     self.assertEqual(error.exception.code, 2)
                     loaded.assert_not_called()
 
+
+class VolumeTests(unittest.TestCase):
+    def test_full_volume_retains_geometry_and_all_slices(self):
+        image = make_image(np.zeros((5, 8, 9), dtype=np.int16))
+        values = np.zeros((5, 8, 9), dtype=np.uint8)
+        values[1:4, 2:5, 3:7] = 1
+        mask = make_image(values)
+        selected, selected_mask, index = segmentation_roi(image, mask, dimension=3)
+        self.assertIs(selected, image)
+        self.assertIsNone(index)
+        check_mask_geometry(selected, selected_mask)
+        np.testing.assert_array_equal(sitk.GetArrayFromImage(selected_mask), values)
+        for bad in (mask * 0, mask * 2, mask[:, :, :1]):
+            with self.assertRaises(ValueError):
+                segmentation_roi(image, bad, dimension=3)
+        with self.assertRaises(ValueError):
+            segmentation_roi(image, mask, dimension=4)
+
+    def test_lndb_full_volume_preserves_reader_consensus(self):
+        first = np.zeros((5, 8, 9), dtype=np.uint8)
+        first[1:3, 2:5, 3:7] = 4
+        second = np.zeros_like(first)
+        second[2:4, 2:5, 3:7] = 7
+        image = make_image(np.zeros_like(first, dtype=np.int16))
+        masks = {1: make_image(first), 3: make_image(second)}
+        nodule = {"mask_RadID": "1,3", "mask_RadFindingID": "4,7"}
+        for level, expected in ((0.5, (first == 4) | (second == 7)), (1, (first == 4) & (second == 7))):
+            selected, mask, index = create_lndb_segmentation(image, nodule, masks, level, dimension=3)
+            self.assertIs(selected, image)
+            self.assertIsNone(index)
+            np.testing.assert_array_equal(sitk.GetArrayFromImage(mask), expected)
+
+    def test_lidc_full_volume_preserves_reader_validation_and_axis_order(self):
+        image = make_image(np.zeros((5, 8, 9), dtype=np.int16))
+        cluster = [SimpleNamespace(scan=SimpleNamespace(id=12), centroid=np.array([3., 4., 2.]))]
+        saved = pd.DataFrame({"annotation_idx": [0], "scan_id": [12], "row": [3.], "column": [4.], "slice": [2.]})
+        combined = np.ones((3, 4, 2), dtype=bool)
+        bbox = (slice(2, 5), slice(3, 7), slice(1, 3))
+        with patch("LIDCfeatureExtraction.consensus", return_value=(combined, bbox, [combined])):
+            selected, mask, index = create_lidc_segmentation(image, cluster, saved, 0.75, dimension=3)
+            self.assertIs(selected, image)
+            self.assertIsNone(index)
+            expected = np.zeros((5, 8, 9), dtype=np.uint8)
+            expected[1:3, 2:5, 3:7] = 1
+            np.testing.assert_array_equal(sitk.GetArrayFromImage(mask), expected)
+        with self.assertRaises(ValueError):
+            create_lidc_segmentation(image, cluster, saved.assign(scan_id=99), dimension=3)
+
+    def test_real_3d_config_extracts_shape_log_lbp_and_3d_wavelets(self):
+        values = np.random.default_rng(42).normal(-500, 100, (32, 32, 32)).astype(np.float32)
+        image = sitk.GetImageFromArray(values)
+        image.SetSpacing((0.7, 0.7, 0.7))
+        labels = np.zeros_like(values, dtype=np.uint8)
+        labels[12:20, 12:20, 12:20] = 1
+        mask = sitk.GetImageFromArray(labels)
+        mask.CopyInformation(image)
+        config = ROOT / "configs/radiomics_segmentation_3d.yaml"
+        extractor = featureextractor.RadiomicsFeatureExtractor(str(config))
+        self.assertFalse(extractor.settings["force2D"])
+        self.assertFalse(extractor.settings["normalize"])
+        self.assertEqual(extractor.settings["binWidth"], 25)
+        self.assertEqual(extractor.settings["resampledPixelSpacing"], [0.7, 0.7, 0.7])
+        self.assertEqual(extractor.enabledImagetypes["LBP3D"]["binWidth"], 0.25)
+        with contextlib.redirect_stderr(io.StringIO()):
+            features = extract_features(image, mask, extractor)
+        self.assertEqual(len(features), 2060)
+        self.assertIn("original_shape_MeshVolume", features)
+        self.assertIn("wavelet-HHH_glcm_Contrast", features)
+        for sigma in range(1, 6):
+            self.assertIn(f"log-sigma-{sigma}-0-mm-3D_firstorder_Mean", features)
+        for name in ("lbp-3D-m1", "lbp-3D-m2", "lbp-3D-k"):
+            self.assertIn(f"{name}_firstorder_Mean", features)
+        self.assertTrue(all(np.isfinite(value) for value in features.values()))
+        self.assertFalse(any("_shape2D_" in name or name.startswith("diagnostics_") for name in features))
+
+    def test_cli_rejects_3d_circles_and_2d_configs(self):
+        for main in (extract_lidc, extract_lndb):
+            arguments = (["--dimension", "3"], ["--dimension", "4"],
+                         ["--roi", "segmentation", "--dimension", "3", "--config", str(ROOT / "configs/radiomics_segmentation_2d.yaml")])
+            for args in arguments:
+                with self.subTest(main=main.__module__, args=args), patch("sys.argv", ["extract", *args]), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        main()
+                    self.assertEqual(error.exception.code, 2)
 
 class ReaderAssociationTests(unittest.TestCase):
     def test_lndb_uses_gt_labels_not_allnods_reader_ids(self):
@@ -340,6 +435,20 @@ class ReaderAssociationTests(unittest.TestCase):
 
 
 class ResumeTests(unittest.TestCase):
+    def test_3d_checkpoints_cannot_resume_as_2d(self):
+        with TemporaryDirectory(dir="/tmp/opencode", prefix="volume-resume-") as directory:
+            output = Path(directory) / "features.csv"
+            config = ROOT / "configs/radiomics_segmentation_3d.yaml"
+            progress = prepare_run(output, config, None, False, [], roi="segmentation", dimension=3)
+            settings = json.loads((progress / "settings.json").read_text())
+            self.assertEqual(settings["dimension"], 3)
+            self.assertEqual(settings["slice_selection"], "full_volume")
+            self.assertEqual(prepare_run(output, config, None, False, [], roi="segmentation", dimension=3), progress)
+            with self.assertRaisesRegex(ValueError, "Settings or inputs changed"):
+                prepare_run(output, config, None, False, [], roi="segmentation", dimension=2)
+            with self.assertRaisesRegex(ValueError, "Settings or inputs changed"):
+                prepare_run(output, config, None, False, [], roi="segmentation", dimension=3, consensus_level=0.75)
+
     def test_bin_width_overrides_are_part_of_checkpoint_settings(self):
         with TemporaryDirectory(dir="/tmp/opencode", prefix="bin-width-resume-") as directory:
             root = Path(directory)
