@@ -21,17 +21,19 @@ from xgboost import XGBClassifier
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "target_classification_mean"
 FEATURE_PATTERN = r"_(shape2D|firstorder|glcm|glrlm|glszm|gldm|ngtdm)_"
+SLICE_IN_NODULE = "slice_in_nodule"
 MIN_SAMPLES_GRID = {
     "randomforestclassifier__min_samples_leaf": [1, 5, 10, 20],
     "randomforestclassifier__min_samples_split": [2, 10, 20, 40],
 }
 
 
-def load_data(path, dataset, targets_path=None):
+def load_data(path, dataset, targets_path=None, multi_slice=False):
     """Load every requested nodule and use its saved patient fold."""
     table = pd.read_csv(path)
     features = table.filter(regex=FEATURE_PATTERN).columns.tolist()
     keys = ["patient_id", "series_uid", "nodule_id"] if dataset == "lidc" else ["LNDbID", "FindingID"]
+    slice_keys = keys + [SLICE_IN_NODULE] if multi_slice else keys
     targets_file = targets_path or ROOT / f"data/processed/{dataset}_nodule_targets.csv"
     targets = pd.read_csv(targets_file).rename(columns={"NoduleID": "FindingID"})
     # An explicit target table defines the experiment's population, including for the circle comparison.
@@ -39,17 +41,39 @@ def load_data(path, dataset, targets_path=None):
     targets = targets[target_columns]
     if targets.empty or targets[keys].isna().any().any() or targets.duplicated(keys).any():
         raise ValueError("Targets must contain unique, non-missing nodule IDs.")
-    if table[keys].isna().any().any() or table.duplicated(keys).any():
-        raise ValueError(f"{path}: feature rows must have unique, non-missing nodule IDs.")
+    if multi_slice and (SLICE_IN_NODULE not in table.columns or table[SLICE_IN_NODULE].isna().any()):
+        raise ValueError(f"{path}: multi-slice datasets need a non-missing {SLICE_IN_NODULE} column.")
+    if table[keys].isna().any().any() or table.duplicated(slice_keys).any():
+        raise ValueError(f"{path}: feature rows must have unique, non-missing"
+                         + (" nodule and slice IDs." if multi_slice else " nodule IDs."))
     folds = pd.read_csv(ROOT / f"data/processed/{dataset}_patient_folds.csv")
     data = targets.merge(folds, on=keys[0], validate="many_to_one", how="left")
-    data = data.merge(table[keys + features], on=keys, validate="one_to_one", how="left", indicator=True)
-    if not features or (targets_path is None and len(table) != len(targets)) or data["_merge"].ne("both").any():
+    data = data.merge(table[slice_keys + features], on=keys,
+                      validate="one_to_many" if multi_slice else "one_to_one",
+                      how="left", indicator=True)
+    # Multi-slice tables repeat each nodule once per slice.
+    nodules = table[keys].drop_duplicates().shape[0] if multi_slice else len(table)
+    if not features or (targets_path is None and nodules != len(targets)) or data["_merge"].ne("both").any():
         raise ValueError(f"{path}: expected features for all {len(targets)} training nodules.")
     if data["fold"].isna().any() or not data[TARGET].isin([1, 2, 3, 4, 5]).all():
         raise ValueError(f"{dataset}: missing folds or invalid target classes.")
     data[features] = data[features].replace([np.inf, -np.inf], np.nan)
     return data.drop(columns="_merge"), features
+
+
+def aggregate_slices(rows, prediction, keys):
+    """Weighted mean of per-slice predictions; centre slices weigh most."""
+    frame = rows[keys + [SLICE_IN_NODULE]].copy()
+    frame["prediction"] = np.asarray(prediction, dtype=float)
+    frame = frame.sort_values(keys + [SLICE_IN_NODULE], kind="stable")
+    grouped = frame.groupby(list(keys), sort=False)
+    position = grouped.cumcount().to_numpy()
+    size = grouped["prediction"].transform("size").to_numpy()
+    # Triangular weights 1, 2, ..., centre, ..., 2, 1 over the nodule's slices.
+    frame["weight"] = np.minimum(position + 1, size - position)
+    frame["weighted_prediction"] = frame["prediction"] * frame["weight"]
+    totals = frame.groupby(list(keys), sort=False)[["weighted_prediction", "weight"]].sum()
+    return totals["weighted_prediction"] / totals["weight"]
 
 
 def make_model(class_weight=None, k=None, smote=False, balanced_forest=False, model_kind="rf"):
@@ -118,6 +142,10 @@ def main():
     parser.add_argument("--original-only", action="store_true", help="Use only features from the unfiltered Original image.")
     parser.add_argument("--smote", action="store_true", help="Scale features and balance classes with SMOTE on training data only.")
     parser.add_argument("--balanced-forest", action="store_true", help="Balance each tree's training sample by undersampling.")
+    parser.add_argument("--multi-slice", action="store_true",
+                        help="Accept several rows per nodule, one per slice numbered by "
+                             "slice_in_nodule, and predict each nodule from the weighted "
+                             "mean of its slice predictions (centre slice weighs most).")
     parser.add_argument("--k", type=int, help="Select the K best features inside each training fold. Default: use all.")
     parser.add_argument("--tune-rf", action="store_true", help="Tune RF minimum leaf and split sizes inside the saved training folds, selecting by macro F1.")
     parser.add_argument("--output", type=Path, help="Directory for this experiment's results and model.")
@@ -136,10 +164,10 @@ def main():
                                 message=r"`BaseEstimator\._(validate_data|check_feature_names|check_n_features)` is deprecated")
         warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn\.utils\.deprecation",
                                 message="'force_all_finite' was renamed to 'ensure_all_finite'")
-    lndb, features = load_data(args.lndb, "lndb", args.lndb_targets)
+    lndb, features = load_data(args.lndb, "lndb", args.lndb_targets, args.multi_slice)
     lidc = lndb.head(0)
     if not args.lndb_only:
-        lidc, lidc_features = load_data(args.lidc, "lidc", args.lidc_targets)
+        lidc, lidc_features = load_data(args.lidc, "lidc", args.lidc_targets, args.multi_slice)
         if set(features) != set(lidc_features):
             raise ValueError("LIDC and LNDb must contain the same radiomics features.")
         features = lidc_features
@@ -156,17 +184,21 @@ def main():
         raise ValueError("Expected five saved LNDb folds.")
     name = args.lndb.stem if args.lndb_only else f"{args.lidc.stem}_{args.lndb.stem}"
     kind = "brf" if args.balanced_forest else args.model
-    output = args.output or ROOT / "models" / f"{kind}_{name}{'_balanced' if class_weight else ''}{f'_k{args.k}' if args.k is not None else ''}{'_smote' if args.smote else ''}{'_original' if args.original_only else ''}{'_tuned' if args.tune_rf else ''}"
+    output = args.output or ROOT / "models" / f"{kind}_{name}{'_balanced' if class_weight else ''}{f'_k{args.k}' if args.k is not None else ''}{'_smote' if args.smote else ''}{'_original' if args.original_only else ''}{'_tuned' if args.tune_rf else ''}{'_multislice' if args.multi_slice else ''}"
     output.mkdir(parents=True, exist_ok=True)
-    predictions = pd.Series(index=lndb.index, dtype=float)
+    # Validation stays at nodule level: one row per nodule, its first slice.
+    lndb_keys = ["LNDbID", "FindingID"]
+    nodules = lndb.drop_duplicates(lndb_keys) if args.multi_slice else lndb
+    predictions = pd.Series(index=nodules.index, dtype=float)
     scores = []
     tuning, training_scores = [], []
     print(f"{kind}: {len(features)} features, class weights: {args.class_weight}", flush=True)
     for fold in folds:
         held_out = lndb["fold"].eq(fold)
+        held_out_nodules = nodules["fold"].eq(fold)
         train = pd.concat([lidc, lndb.loc[~held_out]], ignore_index=True)
         model = make_model(class_weight, args.k, args.smote, args.balanced_forest, args.model)
-        print(f"Fold {fold}: {len(train)} training / {held_out.sum()} validation nodules", flush=True)
+        print(f"Fold {fold}: {len(train)} training / {held_out_nodules.sum()} validation nodules", flush=True)
         if args.tune_rf:
             search = tune_rf(model, train, features, len(lidc), output, f"fold_{fold}")
             model = search.best_estimator_
@@ -178,20 +210,29 @@ def main():
             pd.DataFrame(training_scores).to_csv(output / "training_metrics.csv", index=False)
         else:
             fit_model(model, train[features], train[TARGET], class_weight, label_offset)
-        prediction = model.predict(lndb.loc[held_out, features]) + label_offset
-        predictions.loc[held_out] = prediction
-        scores.append({"fold": fold, **metrics(lndb.loc[held_out, TARGET], prediction)})
+        slice_prediction = model.predict(lndb.loc[held_out, features]) + label_offset
+        if args.multi_slice:
+            # Train on every slice, then combine the slice predictions per nodule.
+            prediction = aggregate_slices(lndb.loc[held_out], slice_prediction, lndb_keys)
+            index = pd.MultiIndex.from_frame(nodules.loc[held_out_nodules, lndb_keys])
+            prediction = np.rint(prediction.reindex(index)).clip(1, 5).astype(int)
+            predictions.loc[held_out_nodules] = prediction.to_numpy()
+            scores.append({"fold": fold, **metrics(nodules.loc[held_out_nodules, TARGET], prediction)})
+        else:
+            predictions.loc[held_out] = slice_prediction
+            scores.append({"fold": fold, **metrics(lndb.loc[held_out, TARGET], slice_prediction)})
         print(pd.Series(scores[-1]).to_string(), flush=True)
-    scores.append({"fold": "overall_oof", **metrics(lndb[TARGET], predictions)})
+    scores.append({"fold": "overall_oof", **metrics(nodules[TARGET], predictions)})
     pd.DataFrame(scores).to_csv(output / "metrics.csv", index=False)
-    oof = lndb[["LNDbID", "FindingID", "fold", TARGET]].copy()
+    oof = nodules[["LNDbID", "FindingID", "fold", TARGET]].copy()
     oof["prediction"] = predictions.astype(int)
     oof.to_csv(output / "validation_predictions.csv", index=False)
     labels = [1, 2, 3, 4, 5]
-    confusion = pd.DataFrame(confusion_matrix(lndb[TARGET], predictions, labels=labels), index=labels, columns=labels)
+    confusion = pd.DataFrame(confusion_matrix(nodules[TARGET], predictions, labels=labels), index=labels, columns=labels)
     confusion.to_csv(output / "confusion_matrix.csv", index_label="true_class")
-    pd.DataFrame({"class": labels, "recall": recall_score(lndb[TARGET], predictions, labels=labels, average=None, zero_division=0)}).to_csv(output / "recall_per_class.csv", index=False)
-    print(f"Fitting final model on all {'LNDb' if args.lndb_only else 'LIDC + LNDb'} training nodules", flush=True)
+    pd.DataFrame({"class": labels, "recall": recall_score(nodules[TARGET], predictions, labels=labels, average=None, zero_division=0)}).to_csv(output / "recall_per_class.csv", index=False)
+    print(f"Fitting final model on all {'LNDb' if args.lndb_only else 'LIDC + LNDb'} training"
+          f" {'slices' if args.multi_slice else 'nodules'}", flush=True)
     train = pd.concat([lidc, lndb], ignore_index=True)
     model = make_model(class_weight, args.k, args.smote, args.balanced_forest, args.model)
     tuning_info = {}
@@ -214,7 +255,7 @@ def main():
                  "lndb_targets_csv": str(lndb_targets_path.resolve()),
                  "smote": args.smote, "balanced_forest": args.balanced_forest,
                  "model_kind": args.model, "label_offset": label_offset, "original_only": args.original_only,
-                 **tuning_info}, output / "model.joblib")
+                 "multi_slice": args.multi_slice, **tuning_info}, output / "model.joblib")
     print(f"Saved metrics, validation predictions and model to {output}")
 
 
