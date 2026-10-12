@@ -1,5 +1,6 @@
 """Fill the competition submission using a saved classifier or rounded regressor."""
 import argparse
+import sys
 from pathlib import Path
 import joblib
 import numpy as np
@@ -7,6 +8,10 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 KEYS = ["LNDbID", "FindingID"]
+# Scripts in src/ run with src/ on the path, not the repository root.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from src.modeling import SLICE_IN_NODULE, aggregate_slices
 
 
 def main():
@@ -22,24 +27,39 @@ def main():
         raise ValueError("Competition submissions require a five-class model.")
     model = saved["model"]
     features = saved["features"]
+    multi_slice = saved.get("multi_slice", False)
     table = pd.read_csv(args.features)
     if not set(features).issubset(table.columns):
         raise ValueError("The test features do not match the saved model.")
+    if multi_slice:
+        if SLICE_IN_NODULE not in table.columns or table[SLICE_IN_NODULE].isna().any():
+            raise ValueError(f"The test features need a non-missing {SLICE_IN_NODULE} column.")
+        if table.duplicated(KEYS + [SLICE_IN_NODULE]).any():
+            raise ValueError("Each nodule slice must appear once.")
+    elif table.duplicated(KEYS).any():
+        raise ValueError("The test features repeat nodules, but this model was trained on single-slice rows.")
 
     X = table[features].replace([np.inf, -np.inf], np.nan)
-    predictions = model.predict(X) + saved.get("label_offset", 0)
+    slice_predictions = model.predict(X) + saved.get("label_offset", 0)
+    if multi_slice:
+        # Combine the slice predictions per nodule, centre slice weighing most.
+        aggregated = aggregate_slices(table, slice_predictions, KEYS)
+        predicted = table[KEYS].drop_duplicates()
+        index = pd.MultiIndex.from_frame(predicted)
+        predictions = aggregated.reindex(index).to_numpy()
+    else:
+        predicted = table[KEYS].copy()
+        predictions = slice_predictions
     if saved.get("target") == "target_regression_mean":
-        if __package__:
-            from .regression import to_classes
-        else:
-            from regression import to_classes
+        from src.regression import to_classes
         predictions = to_classes(predictions)
-    predicted = table[KEYS].copy()
+    elif multi_slice:
+        predictions = np.rint(predictions).clip(1, 5)
     predicted["prediction"] = predictions.astype(int)
 
     submission = pd.read_csv(args.submission).drop(columns=["prediction"])
     result = submission.merge(predicted, on=KEYS, how="left")
-    fallback = int(pd.Series(predictions).mode().iloc[0]) if len(predictions) else 2
+    fallback = int(predicted["prediction"].mode().iloc[0]) if len(predicted) else 2
     missing = result["prediction"].isna().sum()
     result["prediction"] = result["prediction"].fillna(fallback).astype(int)
     if not result["prediction"].between(1, 5).all():
