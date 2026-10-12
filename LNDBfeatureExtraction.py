@@ -1,4 +1,4 @@
-"""Extract LNDb circle, sphere or 2D/3D radiomics from existing reader masks."""
+"""Extract LNDb circle, sphere or segmentation radiomics, with optional axial stacks."""
 
 import argparse
 import logging
@@ -12,6 +12,13 @@ import radiomics
 import SimpleITK as sitk
 from radiomics import featureextractor
 
+from src.multislice_extraction import (
+    combine_results as combine_slice_results,
+    create_circle_slices,
+    extract_slice_features,
+    prepare_run_slices,
+    segmentation_slices,
+)
 from src.radiomics_extraction import (
     combine_results,
     combine_reader_masks,
@@ -20,7 +27,6 @@ from src.radiomics_extraction import (
     create_sphere,
     extract_features,
     load_paths,
-    prepare_run,
     save_csv,
     save_errors,
     segmentation_roi,
@@ -125,7 +131,7 @@ def create_lndb_segmentation(image, nodule, masks, consensus_level=0.5, dimensio
 
 
 def extract_features_for_series(lndb_id, nodules, data_dir, extractor, radius_mm, clip, directory,
-                                roi="circle", masks_path=None, consensus_level=0.5, dimension=2):
+                                roi="circle", masks_path=None, consensus_level=0.5, dimension=2, slice_count=1):
     scan_name = f"LNDb-{lndb_id:04d}"
     checkpoint = directory / f"{scan_name}.features.csv"
     rows = pd.read_csv(checkpoint).to_dict("records") if checkpoint.exists() else []
@@ -136,6 +142,8 @@ def extract_features_for_series(lndb_id, nodules, data_dir, extractor, radius_mm
         return
 
     roi_name = f"{roi}_r{radius_mm:g}" if roi in ("circle", "sphere") else f"segmentation_{dimension}d_c{100 * consensus_level:g}"
+    if slice_count > 1:
+        roi_name += f"_{slice_count}slice"
     print(f"{scan_name}: {len(pending)} nodules, {roi_name}", flush=True)
     errors = []
     masks = {}
@@ -151,15 +159,25 @@ def extract_features_for_series(lndb_id, nodules, data_dir, extractor, radius_mm
                     for reader_id, _ in reader_findings(nodule):
                         if reader_id not in masks:
                             masks[reader_id] = load_reader_mask(masks_path, lndb_id, reader_id)
-                    image_roi, mask, slice_index = create_lndb_segmentation(image, nodule, masks, consensus_level, dimension)
-                    if dimension == 2:
+                    image_roi, mask, slice_index = create_lndb_segmentation(
+                        image, nodule, masks, consensus_level, 3 if slice_count > 1 else dimension,
+                    )
+                    if slice_count > 1:
+                        slices = segmentation_slices(image_roi, mask, slice_count)
+                    elif dimension == 2:
                         row["slice_index"] = slice_index
                 else:
                     center = tuple(nodule[["x", "y", "z"]].astype(float))
-                    create_roi = create_sphere if roi == "sphere" else create_circle
-                    image_roi, mask = create_roi(image, center, radius_mm)
-                row.update(extract_features(image_roi, mask, extractor, clip))
-                rows.append(row)
+                    if slice_count > 1:
+                        slices = create_circle_slices(image, center, radius_mm, slice_count)
+                    else:
+                        create_roi = create_sphere if roi == "sphere" else create_circle
+                        image_roi, mask = create_roi(image, center, radius_mm)
+                if slice_count > 1:
+                    rows.extend(extract_slice_features(slices, row, extractor, clip))
+                else:
+                    row.update(extract_features(image_roi, mask, extractor, clip))
+                    rows.append(row)
             except Exception as exc:
                 errors.append({**row, "error": str(exc)})
         del image
@@ -175,6 +193,8 @@ def main():
     parser.add_argument("--roi", choices=["circle", "sphere", "segmentation"], default="circle")
     parser.add_argument("--dimension", type=int, choices=[2, 3], default=2,
                         help="Circle or axial segmentation (2), sphere or full segmentation (3). Default: 2.")
+    parser.add_argument("--slices", type=int, default=1,
+                        help="Axial slices around the centroid or largest mask slice. Requires --dimension 2. Default: 1.")
     parser.add_argument("--data-dir", type=Path, help="Override the YAML CT directory and default mask/findings locations.")
     parser.add_argument("--masks", type=Path, help="Override the YAML reader masks ZIP.")
     parser.add_argument("--findings", type=Path, help="Override the YAML allNods.csv.")
@@ -194,6 +214,10 @@ def main():
         parser.error("--dimension 3 requires --roi sphere or segmentation.")
     if args.roi == "sphere" and args.dimension != 3:
         parser.error("--roi sphere requires --dimension 3.")
+    if args.slices < 1:
+        parser.error("--slices must be positive.")
+    if args.slices > 1 and args.dimension != 2:
+        parser.error("--slices greater than 1 requires --dimension 2.")
     args.paths = args.paths.expanduser().resolve()
     paths = load_paths(args.paths)
     config_name = f"{args.roi}_3d" if args.dimension == 3 else args.roi
@@ -258,10 +282,14 @@ def main():
 
     intensity = "clipped" if args.clip else "hu"
     roi_name = f"{args.roi}_r{args.radius:g}" if args.roi in ("circle", "sphere") else f"segmentation_{args.dimension}d_c{100 * args.consensus:g}"
+    if args.slices > 1:
+        roi_name += f"_{args.slices}slice"
     bin_suffix = f"_bw{args.bin_width:g}" if args.bin_width is not None else ""
     output = args.output or paths["outputs"]["features"] / f"{dataset}_{roi_name}{bin_suffix}_{intensity}.csv"
-    directory = prepare_run(output, args.config, args.radius, args.clip, sources,
-                            roi=args.roi, consensus_level=args.consensus, bin_width=args.bin_width, dimension=args.dimension)
+    directory = prepare_run_slices(
+        output, args.config, args.radius, args.clip, sources, slice_count=args.slices,
+        roi=args.roi, consensus_level=args.consensus, bin_width=args.bin_width, dimension=args.dimension,
+    )
     if args.roi == "segmentation":
         save_csv(mapping, directory / "mask_mapping.csv")
     radiomics.setVerbosity(logging.ERROR)
@@ -269,8 +297,10 @@ def main():
         extract_features_for_series(
             int(lndb_id), scan_nodules, args.data_dir, extractor, args.radius, args.clip, directory,
             roi=args.roi, masks_path=args.masks, consensus_level=args.consensus, dimension=args.dimension,
+            slice_count=args.slices,
         )
-    return int(combine_results(directory, nodules, KEYS, output) > 0)
+    combine = combine_slice_results if args.slices > 1 else combine_results
+    return int(combine(directory, nodules, KEYS, output) > 0)
 
 
 if __name__ == "__main__":

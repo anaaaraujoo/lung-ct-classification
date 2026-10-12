@@ -12,13 +12,19 @@ import SimpleITK as sitk
 from pylidc.utils import consensus
 from radiomics import featureextractor
 
+from src.multislice_extraction import (
+    combine_results as combine_slice_results,
+    create_circle_slices,
+    extract_slice_features,
+    prepare_run_slices,
+    segmentation_slices,
+)
 from src.radiomics_extraction import (
     combine_results,
     create_circle,
     create_sphere,
     extract_features,
     load_paths,
-    prepare_run,
     save_csv,
     save_errors,
     segmentation_roi,
@@ -59,6 +65,8 @@ def main():
     parser.add_argument("--roi", choices=["circle", "sphere", "segmentation"], default="circle")
     parser.add_argument("--dimension", type=int, choices=[2, 3], default=2,
                         help="Circle or axial segmentation (2), sphere or full segmentation (3). Default: 2.")
+    parser.add_argument("--slices", type=int, default=1,
+                        help="Axial slices around the centroid or largest mask slice. Requires --dimension 2. Default: 1.")
     parser.add_argument("--consensus", type=float, default=0.5, help="Required fraction of nodule readers, including ties. Default: 0.5.")
     parser.add_argument("--radius", type=float, default=21, help="Radius in mm. Default: full-training LIDC P99.")
     parser.add_argument("--clip", action="store_true", help="Clip HU to [-1000, 400].")
@@ -74,6 +82,10 @@ def main():
         parser.error("--dimension 3 requires --roi sphere or segmentation.")
     if args.roi == "sphere" and args.dimension != 3:
         parser.error("--roi sphere requires --dimension 3.")
+    if args.slices < 1:
+        parser.error("--slices must be positive.")
+    if args.slices > 1 and args.dimension != 2:
+        parser.error("--slices greater than 1 requires --dimension 2.")
     args.paths = args.paths.expanduser().resolve()
     paths = load_paths(args.paths)
     validate_consensus(args.consensus)
@@ -119,12 +131,15 @@ def main():
 
     intensity = "clipped" if args.clip else "hu"
     roi_name = f"{args.roi}_r{args.radius:g}" if args.roi in ("circle", "sphere") else f"segmentation_{args.dimension}d_c{100 * args.consensus:g}"
+    if args.slices > 1:
+        roi_name += f"_{args.slices}slice"
     bin_suffix = f"_bw{args.bin_width:g}" if args.bin_width is not None else ""
     output = args.output or paths["outputs"]["features"] / f"lidc_{roi_name}{bin_suffix}_{intensity}.csv"
-    directory = prepare_run(
+    directory = prepare_run_slices(
         output, args.config, args.radius, args.clip,
         [Path(__file__), args.paths, targets_path, folds_path, annotations_path],
-        roi=args.roi, consensus_level=args.consensus, bin_width=args.bin_width, dimension=args.dimension,
+        slice_count=args.slices, roi=args.roi, consensus_level=args.consensus,
+        bin_width=args.bin_width, dimension=args.dimension,
     )
     radiomics.setVerbosity(logging.ERROR)
 
@@ -159,18 +174,26 @@ def main():
                     if args.roi == "segmentation":
                         image_roi, mask, slice_index = create_lidc_segmentation(
                             image, clusters[row["nodule_id"]], saved[saved["nodule_id"] == row["nodule_id"]],
-                            args.consensus, args.dimension,
+                            args.consensus, 3 if args.slices > 1 else args.dimension,
                         )
-                        if args.dimension == 2:
+                        if args.slices > 1:
+                            slices = segmentation_slices(image_roi, mask, args.slices)
+                        elif args.dimension == 2:
                             row["slice_index"] = slice_index
                     else:
                         # PyLIDC indices are [row, column, slice], SimpleITK uses [x, y, z].
                         index = tuple(nodule[["column", "row", "slice"]].astype(float))
                         center = image.TransformContinuousIndexToPhysicalPoint(index)
-                        create_roi = create_sphere if args.roi == "sphere" else create_circle
-                        image_roi, mask = create_roi(image, center, args.radius)
-                    row.update(extract_features(image_roi, mask, extractor, args.clip))
-                    rows.append(row)
+                        if args.slices > 1:
+                            slices = create_circle_slices(image, center, args.radius, args.slices)
+                        else:
+                            create_roi = create_sphere if args.roi == "sphere" else create_circle
+                            image_roi, mask = create_roi(image, center, args.radius)
+                    if args.slices > 1:
+                        rows.extend(extract_slice_features(slices, row, extractor, args.clip))
+                    else:
+                        row.update(extract_features(image_roi, mask, extractor, args.clip))
+                        rows.append(row)
                 except Exception as exc:
                     errors.append({**row, "error": str(exc)})
             del image
@@ -179,7 +202,8 @@ def main():
             save_csv(pd.DataFrame(rows), checkpoint)
         save_errors(errors, directory / f"{scan_name}.errors.csv")
 
-    return int(combine_results(directory, nodules, KEYS, output) > 0)
+    combine = combine_slice_results if args.slices > 1 else combine_results
+    return int(combine(directory, nodules, KEYS, output) > 0)
 
 
 if __name__ == "__main__":
