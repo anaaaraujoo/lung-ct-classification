@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from src.make_predictions import main as make_submission
-from src.modeling import TARGET, metrics
+from src.modeling import EXCLUDED_LNDB_IDS, TARGET, metrics
 from src.regression import REGRESSION_TARGET, load_regression_data, main, make_model, regression_metrics, to_classes
 
 
@@ -74,7 +74,7 @@ class RegressionTests(unittest.TestCase):
             root = Path(temporary)
             means = np.tile([1., 1.75, 2.5, 3., 3.5, 4.75], 5)
             folds = np.repeat(np.arange(1, 6), 6)
-            ids = np.arange(1, len(means) + 1)
+            ids = np.array([*range(1, len(means)), 181])
             targets = pd.DataFrame({"LNDbID": ids, "NoduleID": 1, REGRESSION_TARGET: means, TARGET: to_classes(means)})
             targets.to_csv(root / "targets.csv", index=False)
             pd.DataFrame({"LNDbID": ids, "fold": folds}).to_csv(root / "folds.csv", index=False)
@@ -93,13 +93,16 @@ class RegressionTests(unittest.TestCase):
                      "lidc": {"targets": root / "lidc_targets.csv", "folds": root / "lidc_folds.csv"},
                      "training": {"lndb_features": root / "features.csv", "lidc_features": root / "lidc_features.csv"},
                      "outputs": {"models": root}}
-            for lndb_only, original_only in ((False, False), (True, True)):
-                output = root / f"results_{lndb_only}"
+            for lndb_only, original_only, exclude in ((False, False, False), (True, True, False),
+                                                       (True, True, True)):
+                output = root / f"results_{lndb_only}_{exclude}"
                 args = ["regression", "--output", str(output)]
                 if lndb_only:
                     args += ["--lndb-only"]
                 if original_only:
                     args += ["--original-only"]
+                if exclude:
+                    args += ["--exclude-duplicate-lndb"]
                 run_paths = paths if not lndb_only else {
                     "lndb": paths["lndb"], "outputs": paths["outputs"],
                     "training": {"lndb_features": root / "features.csv"},
@@ -111,7 +114,7 @@ class RegressionTests(unittest.TestCase):
                     fitted.append(model)
                     return model
 
-                with self.subTest(lndb_only=lndb_only), patch("sys.argv", args), \
+                with self.subTest(lndb_only=lndb_only, exclude=exclude), patch("sys.argv", args), \
                         patch("src.regression.load_paths", return_value=run_paths), \
                         patch("src.regression.make_model", side_effect=record_model), \
                         contextlib.redirect_stdout(io.StringIO()):
@@ -119,30 +122,31 @@ class RegressionTests(unittest.TestCase):
                 self.assertEqual(len(fitted), 6)
                 selected_features = features[:1] if original_only else features
                 for fold, model in zip(range(1, 6), fitted):
-                    train = table.loc[folds != fold, selected_features]
+                    train = table.loc[(folds != fold) & ((ids != 181) if exclude else True), selected_features]
                     if not lndb_only:
                         train = pd.concat([lidc_features[selected_features], train])
                     expected = train.median().to_numpy()
                     np.testing.assert_allclose(model.named_steps["simpleimputer"].statistics_, expected)
                     np.testing.assert_allclose(model.named_steps["standardscaler"].mean_, train.fillna(train.median()).mean())
                 predictions = pd.read_csv(output / "validation_predictions.csv")
-                self.assertEqual(len(predictions), len(table))
-                np.testing.assert_array_equal(predictions[REGRESSION_TARGET], means)
+                self.assertEqual(len(predictions), len(table) - int(exclude))
+                np.testing.assert_array_equal(predictions[REGRESSION_TARGET], means[:-1] if exclude else means)
                 np.testing.assert_array_equal(predictions["prediction"], to_classes(predictions["prediction_continuous"]))
                 self.assertTrue((predictions["prediction_continuous"] % 1 != 0).any())
                 regression = pd.read_csv(output / "regression_metrics.csv")
                 classification = pd.read_csv(output / "metrics.csv")
                 self.assertEqual(regression["fold"].tolist(), ["1", "2", "3", "4", "5", "overall_oof"])
                 self.assertEqual(classification["fold"].tolist(), regression["fold"].tolist())
-                expected = regression_metrics(means, predictions["prediction_continuous"])
+                expected = regression_metrics(predictions[REGRESSION_TARGET], predictions["prediction_continuous"])
                 for name, value in expected.items():
                     self.assertAlmostEqual(regression.iloc[-1][name], value)
-                for name, value in metrics(to_classes(means), predictions["prediction"]).items():
+                for name, value in metrics(predictions[TARGET], predictions["prediction"]).items():
                     self.assertAlmostEqual(classification.iloc[-1][name], value)
-                self.assertEqual(pd.read_csv(output / "confusion_matrix.csv", index_col=0).to_numpy().sum(), len(table))
+                self.assertEqual(pd.read_csv(output / "confusion_matrix.csv", index_col=0).to_numpy().sum(), len(predictions))
                 self.assertEqual(pd.read_csv(output / "recall_per_class.csv")["class"].tolist(), [1, 2, 3, 4, 5])
                 saved = joblib.load(output / "model.joblib")
                 self.assertEqual(saved["target"], REGRESSION_TARGET)
+                self.assertEqual(saved["excluded_lndb_ids"], sorted(EXCLUDED_LNDB_IDS) if exclude else [])
                 self.assertEqual(saved["features"], selected_features)
                 self.assertEqual(saved["class_conversion"], "half_up_clip_1_5")
                 self.assertEqual(saved["lidc_csv"], None if lndb_only else str(root / "lidc_features.csv"))

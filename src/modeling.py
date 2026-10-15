@@ -8,12 +8,13 @@ import pandas as pd
 from imblearn.ensemble import BalancedRandomForestClassifier
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import make_pipeline
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, cohen_kappa_score, confusion_matrix, f1_score, make_scorer, mean_absolute_error, recall_score
-from sklearn.model_selection import GridSearchCV, PredefinedSplit
+from sklearn.model_selection import GridSearchCV, ParameterGrid, PredefinedSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
@@ -28,14 +29,41 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGET = "target_classification_mean"
 FEATURE_PATTERN = r"_(shape|shape2D|firstorder|glcm|glrlm|glszm|gldm|ngtdm)_"
 SLICE_IN_NODULE = "slice_in_nodule"
+# Equal raw SHA-256 and image headers in notebooks/radiomics_results_analysis.ipynb.
+# Retain the lower LNDbID in each confirmed pair.
+EXCLUDED_LNDB_IDS = frozenset({181, 182, 183, 184, 185, 188, 189, 194, 195, 198, 226})
 MIN_SAMPLES_GRID = {
     "randomforestclassifier__min_samples_leaf": [1, 5, 10, 20],
     "randomforestclassifier__min_samples_split": [2, 10, 20, 40],
 }
+BALANCED_FOREST_GRID = {
+    "balancedrandomforestclassifier__max_depth": [None, 10],
+    "balancedrandomforestclassifier__max_features": ["sqrt", 0.1, 0.3],
+    "balancedrandomforestclassifier__min_samples_leaf": [1, 3, 5],
+}
+XGBOOST_STRUCTURE_GRID = {
+    "xgbclassifier__max_depth": [2, 3, 4],
+    "xgbclassifier__min_child_weight": [1, 5],
+    "xgbclassifier__colsample_bytree": [0.6, 0.8, 1.0],
+}
+XGBOOST_ROUNDS_GRID = [
+    {"xgbclassifier__learning_rate": [0.1], "xgbclassifier__n_estimators": [150]},
+    {"xgbclassifier__learning_rate": [0.05], "xgbclassifier__n_estimators": [300]},
+    {"xgbclassifier__learning_rate": [0.03], "xgbclassifier__n_estimators": [500]},
+]
+QUICK_FOREST_GRID = {
+    "balancedrandomforestclassifier__max_features": ["sqrt", 0.1],
+    "balancedrandomforestclassifier__min_samples_leaf": [1, 3],
+}
+QUICK_XGBOOST_GRID = {
+    "xgbclassifier__max_depth": [2, 3],
+    "xgbclassifier__min_child_weight": [1, 5],
+}
 
 
-def load_data(path, dataset, targets_path=None, paths=None, binary=False, multi_slice=False):
-    """Load every requested nodule and use its saved patient fold."""
+def load_data(path, dataset, targets_path=None, paths=None, binary=False, multi_slice=False,
+              exclude_duplicate_lndb=False):
+    """Load requested nodules on saved folds, optionally excluding LNDb CT copies."""
     table = pd.read_csv(path)
     features = table.filter(regex=FEATURE_PATTERN).columns.tolist()
     keys = ["patient_id", "series_uid", "nodule_id"] if dataset == "lidc" else ["LNDbID", "FindingID"]
@@ -43,6 +71,9 @@ def load_data(path, dataset, targets_path=None, paths=None, binary=False, multi_
     locations = (paths or load_paths())[dataset]
     targets_file = targets_path or locations["targets"]
     targets = pd.read_csv(targets_file).rename(columns={"NoduleID": "FindingID"})
+    if dataset == "lndb" and exclude_duplicate_lndb:
+        table = table[~table["LNDbID"].isin(EXCLUDED_LNDB_IDS)].copy()
+        targets = targets[~targets["LNDbID"].isin(EXCLUDED_LNDB_IDS)].copy()
     # An explicit target table defines the experiment's population, including for the circle comparison.
     target_columns = keys + [name for name in targets if name == "ratings" or name.startswith("target_")]
     targets = targets[target_columns]
@@ -73,6 +104,13 @@ def load_data(path, dataset, targets_path=None, paths=None, binary=False, multi_
     data[target] = data[target].astype(int)
     data[features] = data[features].replace([np.inf, -np.inf], np.nan)
     return data.drop(columns="_merge"), features
+
+
+def prefer_normalized_pairs(features):
+    raw = {name.removesuffix("Normalized") for name in features if name.endswith("Normalized")}
+    if not raw.intersection(features):
+        raise ValueError("No raw/Normalized radiomics feature pairs found.")
+    return [name for name in features if name not in raw]
 
 
 def aggregate_slices(rows, prediction, keys):
@@ -148,6 +186,46 @@ def tune_rf(model, train, features, n_lidc, output, fold, binary=False):
     return search
 
 
+def tune_balanced_model(model, train, features, n_lidc, output, fold, class_weight, label_offset,
+                        balanced_forest=False, structure_grid=None, rounds_grid=None, quick=False):
+    """Select parameters on inner LNDb folds, then refit on the outer training rows."""
+    if structure_grid is None:
+        structure_grid = (QUICK_FOREST_GRID if balanced_forest else QUICK_XGBOOST_GRID) if quick else (
+            BALANCED_FOREST_GRID if balanced_forest else XGBOOST_STRUCTURE_GRID)
+    splits = list(lndb_cv(train, n_lidc).split())
+    if quick:
+        splits = [max(splits, key=lambda split: train.iloc[split[1]][TARGET].eq(5).sum())]
+        print(f"Quick tuning on inner LNDb fold {train.iloc[splits[0][1]]['fold'].iloc[0]}", flush=True)
+
+    def search(grid, fixed, stage):
+        rows = []
+        for params in ParameterGrid(grid):
+            settings = {**fixed, **params}
+            scores = []
+            for inner_train, inner_valid in splits:
+                candidate = clone(model).set_params(**settings)
+                fit_model(candidate, train.iloc[inner_train][features], train.iloc[inner_train][TARGET],
+                          class_weight, label_offset)
+                prediction = candidate.predict(train.iloc[inner_valid][features]) + label_offset
+                scores.append(balanced_accuracy_score(train.iloc[inner_valid][TARGET], prediction))
+            rows.append({"stage": stage, **settings, **{f"split{i}_score": score for i, score in enumerate(scores)},
+                         "mean_inner_balanced_accuracy": np.mean(scores)})
+            print(f"{stage}: {settings} -> {np.mean(scores):.4f}", flush=True)
+        return rows, max(rows, key=lambda row: row["mean_inner_balanced_accuracy"])
+
+    rows, best = search(structure_grid, {}, "structure")
+    if not balanced_forest and not quick:
+        later, best = search(rounds_grid or XGBOOST_ROUNDS_GRID,
+                             {key: best[key] for key in ParameterGrid(structure_grid)[0]}, "rounds")
+        rows.extend(later)
+    pd.DataFrame(rows).to_csv(output / f"grid_{fold}.csv", index=False)
+    params = {key: best[key] for key in model.get_params() if key in best}
+    fitted = clone(model).set_params(**params)
+    fit_model(fitted, train[features], train[TARGET], class_weight, label_offset)
+    print(f"Best inner balanced accuracy: {best['mean_inner_balanced_accuracy']:.4f}, parameters: {params}", flush=True)
+    return fitted, best["mean_inner_balanced_accuracy"], params
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--paths", type=Path, default=ROOT / "configs/paths.yaml", help="YAML with file locations.")
@@ -156,10 +234,13 @@ def main():
     parser.add_argument("--lidc-targets", type=Path, help="Explicit LIDC nodule population. Default: all cleaned LIDC targets.")
     parser.add_argument("--lndb-targets", type=Path, help="Explicit LNDb nodule population, e.g. the saved ge3 targets.")
     parser.add_argument("--lndb-only", action="store_true", help="Train using only the LNDb training folds.")
+    parser.add_argument("--exclude-duplicate-lndb", action="store_true",
+                        help="Exclude confirmed duplicate LNDb CT scans. Default: use all scans.")
     parser.add_argument("--binary", action="store_true", help="Use saved target_binary_mean: mean < 3 is 0, mean > 3 is 1, mean = 3 is excluded.")
     parser.add_argument("--class-weight", choices=["none", "balanced"], default="none")
     parser.add_argument("--model", choices=["rf", "logistic", "xgboost"], default="rf")
     parser.add_argument("--original-only", action="store_true", help="Use only features from the unfiltered Original image.")
+    parser.add_argument("--normalized-pairs", action="store_true", help="Keep normalized radiomics features instead of their raw counterparts.")
     parser.add_argument("--smote", action="store_true", help="Scale features and balance classes with SMOTE on training data only.")
     parser.add_argument("--balanced-forest", action="store_true", help="Balance each tree's training sample by undersampling.")
     parser.add_argument("--multi-slice", action="store_true",
@@ -168,6 +249,8 @@ def main():
                              "mean of its slice predictions (centre slice weighs most).")
     parser.add_argument("--k", type=int, help="Select the K best features inside each training fold. Default: use all.")
     parser.add_argument("--tune-rf", action="store_true", help="Tune RF minimum leaf and split sizes inside the saved training folds, selecting by macro F1.")
+    parser.add_argument("--tune", action="store_true", help="Tune Balanced RF or weighted XGBoost on inner LNDb folds by balanced accuracy.")
+    parser.add_argument("--quick-tune", action="store_true", help="Grid-search four Balanced RF or weighted XGBoost settings on one inner LNDb fold per outer fold.")
     parser.add_argument("--output", type=Path, help="Directory for this experiment's results and model.")
     args = parser.parse_args()
     args.paths = args.paths.expanduser().resolve()
@@ -184,6 +267,10 @@ def main():
         parser.error("--balanced-forest requires --model rf.")
     if args.tune_rf and (args.model != "rf" or args.balanced_forest or args.smote):
         parser.error("--tune-rf requires ordinary RF without SMOTE or --balanced-forest.")
+    do_tune = args.tune or args.quick_tune
+    if do_tune and (args.tune and args.quick_tune or args.tune_rf or args.binary or args.multi_slice or args.smote or
+                   not (args.balanced_forest or args.model == "xgboost" and args.class_weight == "balanced")):
+        parser.error("Tuning requires five-class Balanced RF or XGBoost with --class-weight balanced, without SMOTE or multi-slice. Choose one tuning flag.")
     if args.smote or args.balanced_forest:
         # imbalanced-learn 0.12 uses these older APIs, which still work in sklearn 1.6.
         warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn\.base",
@@ -191,7 +278,8 @@ def main():
         warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn\.utils\.deprecation",
                                 message="'force_all_finite' was renamed to 'ensure_all_finite'")
     lndb, features = load_data(args.lndb, "lndb", targets_path=args.lndb_targets, paths=paths,
-                              binary=args.binary, multi_slice=args.multi_slice)
+                               binary=args.binary, multi_slice=args.multi_slice,
+                               exclude_duplicate_lndb=args.exclude_duplicate_lndb)
     lidc = lndb.head(0)
     if not args.lndb_only:
         lidc, lidc_features = load_data(args.lidc, "lidc", targets_path=args.lidc_targets, paths=paths,
@@ -203,6 +291,8 @@ def main():
         features = [column for column in features if column.startswith("original_")]
         if not features:
             parser.error("No Original features found in the supplied CSVs.")
+    if args.normalized_pairs:
+        features = prefer_normalized_pairs(features)
     class_weight = None if args.class_weight == "none" else args.class_weight
     label_offset = int(args.model == "xgboost" and not args.binary)
     if args.k is not None and not 1 <= args.k <= len(features):
@@ -212,7 +302,11 @@ def main():
         raise ValueError("Expected five saved LNDb folds.")
     name = args.lndb.stem if args.lndb_only else f"{args.lidc.stem}_{args.lndb.stem}"
     kind = "brf" if args.balanced_forest else args.model
-    output = args.output or paths["outputs"]["models"] / f"{kind}_{name}{'_balanced' if class_weight else ''}{f'_k{args.k}' if args.k is not None else ''}{'_smote' if args.smote else ''}{'_original' if args.original_only else ''}{'_tuned' if args.tune_rf else ''}{'_binary' if args.binary else ''}{'_multislice' if args.multi_slice else ''}"
+    output = args.output or paths["outputs"]["models"] / f"{kind}_{name}{'_balanced' if class_weight else ''}{f'_k{args.k}' if args.k is not None else ''}{'_smote' if args.smote else ''}{'_original' if args.original_only else ''}{'_normalized_pairs' if args.normalized_pairs else ''}{'_quick_tuned' if args.quick_tune else '_tuned' if args.tune_rf or args.tune else ''}{'_binary' if args.binary else ''}{'_multislice' if args.multi_slice else ''}{'_dedup' if args.exclude_duplicate_lndb else ''}"
+    if not (do_tune or args.tune_rf) and any(word in output.name.lower() for word in ("grid", "tuned")):
+        parser.error("Output name suggests tuning, but no tuning flag was supplied.")
+    if (do_tune or args.tune_rf) and output.exists() and any(output.iterdir()):
+        parser.error(f"Tuned output already contains files: {output}. Choose a new directory.")
     output.mkdir(parents=True, exist_ok=True)
     # Validation stays at nodule level: one row per nodule, its first slice.
     lndb_keys = ["LNDbID", "FindingID"]
@@ -236,6 +330,12 @@ def main():
                                     **metrics(train[target], training_prediction, args.binary)})
             pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
             pd.DataFrame(training_scores).to_csv(output / "training_metrics.csv", index=False)
+        elif do_tune:
+            model, score, params = tune_balanced_model(model, train, features, len(lidc), output,
+                                                       f"fold_{fold}", class_weight, label_offset,
+                                                       args.balanced_forest, quick=args.quick_tune)
+            tuning.append({"fold": fold, "inner_balanced_accuracy": score, **params})
+            pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
         else:
             fit_model(model, train[features], train[target], class_weight, label_offset)
         slice_prediction = model.predict(lndb.loc[held_out, features]) + label_offset
@@ -270,7 +370,20 @@ def main():
         tuning.append({"fold": "final", "inner_macro_f1": search.best_score_, **search.best_params_})
         pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
         tuning_info = {"param_grid": MIN_SAMPLES_GRID, "tuning_scoring": "macro_f1",
-                       "best_params": search.best_params_, "inner_cv": "saved LNDb folds, LIDC training only"}
+                        "best_params": search.best_params_, "inner_cv": "saved LNDb folds, LIDC training only"}
+    elif do_tune:
+        model, score, params = tune_balanced_model(model, train, features, len(lidc), output, "final",
+                                                   class_weight, label_offset, args.balanced_forest,
+                                                   quick=args.quick_tune)
+        tuning.append({"fold": "final", "inner_balanced_accuracy": score, **params})
+        pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
+        grid = ((QUICK_FOREST_GRID if args.balanced_forest else QUICK_XGBOOST_GRID) if args.quick_tune else
+                BALANCED_FOREST_GRID if args.balanced_forest else
+                {"structure": XGBOOST_STRUCTURE_GRID, "rounds": XGBOOST_ROUNDS_GRID})
+        tuning_info = {"param_grid": grid,
+                       "tuning_scoring": "balanced_accuracy", "best_params": params,
+                       "inner_cv": ("one saved LNDb fold with most class-5 nodules, LIDC training only" if args.quick_tune
+                                    else "saved LNDb folds, LIDC training only")}
     else:
         fit_model(model, train[features], train[target], class_weight, label_offset)
     lidc_targets_path = args.lidc_targets or paths["lidc"]["targets"]
@@ -281,8 +394,11 @@ def main():
                  "lidc_targets_csv": None if args.lndb_only else str(lidc_targets_path.resolve()),
                  "lndb_targets_csv": str(lndb_targets_path.resolve()),
                  "smote": args.smote, "balanced_forest": args.balanced_forest,
-                 "model_kind": args.model, "label_offset": label_offset, "original_only": args.original_only,
-                 "multi_slice": args.multi_slice, **tuning_info}, output / "model.joblib")
+                  "model_kind": args.model, "label_offset": label_offset, "original_only": args.original_only,
+                  "normalized_pairs": args.normalized_pairs,
+                  "multi_slice": args.multi_slice,
+                  "excluded_lndb_ids": sorted(EXCLUDED_LNDB_IDS) if args.exclude_duplicate_lndb else [],
+                 **tuning_info}, output / "model.joblib")
     print(f"Saved metrics, validation predictions and model to {output}")
 
 

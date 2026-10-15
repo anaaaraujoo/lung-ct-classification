@@ -11,13 +11,38 @@ import numpy as np
 import pandas as pd
 
 from src.make_predictions import main as make_submission
-from src.modeling import SLICE_IN_NODULE, TARGET, aggregate_slices, load_data, main, metrics
+from src.modeling import EXCLUDED_LNDB_IDS, SLICE_IN_NODULE, TARGET, aggregate_slices, load_data, main, metrics
 
 KEYS = ["LNDbID", "FindingID"]
 FEATURE = "original_firstorder_Mean"
 
 
 class MultiSliceTests(unittest.TestCase):
+    def test_ct_exclusion_removes_every_nodule_and_slice_before_fold_assignment(self):
+        with TemporaryDirectory(dir="/tmp/opencode", prefix="multislice-dedup-") as temporary:
+            root = Path(temporary)
+            targets = pd.DataFrame({"LNDbID": [161, 161, 181, 181], "NoduleID": [1, 2, 1, 2],
+                                    TARGET: [2, 4, 3, 5], "target_binary_mean": [0, 1, np.nan, 1]})
+            targets.to_csv(root / "targets.csv", index=False)
+            pd.DataFrame({"LNDbID": [161, 181], "fold": [1, 3]}).to_csv(root / "folds.csv", index=False)
+            table = targets.loc[targets.index.repeat(5)].rename(columns={"NoduleID": "FindingID"}).reset_index(drop=True)
+            table[SLICE_IN_NODULE] = np.tile(np.arange(5), 4)
+            table[FEATURE] = np.arange(len(table), dtype=float)
+            table.to_csv(root / "features.csv", index=False)
+            paths = {"lndb": {"targets": root / "targets.csv", "folds": root / "folds.csv"}}
+            for binary in (False, True):
+                with self.subTest(binary=binary):
+                    full, _ = load_data(root / "features.csv", "lndb", paths=paths, binary=binary, multi_slice=True)
+                    self.assertEqual(len(full), 15 if binary else 20)
+                    data, features = load_data(root / "features.csv", "lndb", paths=paths, binary=binary,
+                                               multi_slice=True, exclude_duplicate_lndb=True)
+                    self.assertEqual(len(data), 10)
+                    self.assertEqual(data["LNDbID"].tolist(), [161] * 10)
+                    self.assertEqual(data["FindingID"].tolist(), [1] * 5 + [2] * 5)
+                    self.assertEqual(data[SLICE_IN_NODULE].tolist(), list(range(5)) * 2)
+                    self.assertEqual(data["fold"].tolist(), [1] * 10)
+                    self.assertEqual(features, [FEATURE])
+
     def test_triangular_weights_sort_slices_and_keep_nodules_separate(self):
         rows = pd.DataFrame({"LNDbID": [2, 1, 1, 1, 1, 1], "FindingID": [1] * 6,
                              SLICE_IN_NODULE: [0, 4, 2, 0, 3, 1]})
@@ -59,7 +84,7 @@ class MultiSliceTests(unittest.TestCase):
     def test_cli_saves_one_prediction_per_nodule_for_both_targets(self):
         with TemporaryDirectory(dir="/tmp/opencode", prefix="multislice-cli-") as temporary:
             root = Path(temporary)
-            targets = pd.DataFrame({"LNDbID": np.arange(1, 26), "NoduleID": [1] * 25,
+            targets = pd.DataFrame({"LNDbID": [*range(1, 25), 181], "NoduleID": [1] * 25,
                                     TARGET: np.tile([1, 2, 3, 4, 5], 5), "fold": np.repeat(np.arange(1, 6), 5)})
             targets["target_binary_mean"] = np.where(targets[TARGET] == 3, np.nan, (targets[TARGET] > 3).astype(float))
             targets.drop(columns="fold").to_csv(root / "targets.csv", index=False)
@@ -73,21 +98,25 @@ class MultiSliceTests(unittest.TestCase):
                      "lidc": {"targets": root / "unused.csv"},
                      "training": {"lidc_features": root / "unused.csv", "lndb_features": root / "features.csv"},
                      "outputs": {"models": root}}
-            for binary in (False, True):
+            for binary, exclude in ((False, False), (True, False), (False, True), (True, True)):
                 args = ["modeling", "--lndb-only", "--multi-slice", "--class-weight", "balanced"]
                 if binary:
                     args += ["--binary"]
-                with self.subTest(binary=binary), patch("sys.argv", args), \
-                        patch("src.modeling.load_paths", return_value=paths), contextlib.redirect_stdout(io.StringIO()):
+                if exclude:
+                    args += ["--exclude-duplicate-lndb"]
+                with self.subTest(binary=binary, exclude=exclude), patch("sys.argv", args), \
+                         patch("src.modeling.load_paths", return_value=paths), contextlib.redirect_stdout(io.StringIO()):
                     main()
-                output = root / f"rf_features_balanced{'_binary' if binary else ''}_multislice"
+                output = root / f"rf_features_balanced{'_binary' if binary else ''}_multislice{'_dedup' if exclude else ''}"
                 saved = joblib.load(output / "model.joblib")
                 target = "target_binary_mean" if binary else TARGET
                 self.assertTrue(saved["multi_slice"])
+                self.assertEqual(saved["excluded_lndb_ids"], sorted(EXCLUDED_LNDB_IDS) if exclude else [])
                 self.assertEqual(saved["target"], target)
                 self.assertEqual(saved["model"].named_steps["randomforestclassifier"].n_estimators, 500)
                 oof = pd.read_csv(output / "validation_predictions.csv")
-                self.assertEqual(len(oof), 20 if binary else 25)
+                self.assertEqual(len(oof), (20 if binary else 25) - int(exclude))
+                self.assertEqual(181 in oof["LNDbID"].values, not exclude)
                 self.assertFalse(oof.duplicated(KEYS).any())
                 scores = pd.read_csv(output / "metrics.csv")
                 for name, value in metrics(oof[target], oof["prediction"], binary).items():

@@ -12,10 +12,10 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 if __package__:
-    from .modeling import ROOT, TARGET, load_data, metrics
+    from .modeling import EXCLUDED_LNDB_IDS, ROOT, TARGET, load_data, metrics
     from .radiomics_extraction import load_paths
 else:
-    from modeling import ROOT, TARGET, load_data, metrics
+    from modeling import EXCLUDED_LNDB_IDS, ROOT, TARGET, load_data, metrics
     from radiomics_extraction import load_paths
 
 REGRESSION_TARGET = "target_regression_mean"
@@ -26,8 +26,9 @@ def to_classes(predictions):
     return np.clip(np.floor(np.asarray(predictions) + 0.5), 1, 5).astype(int)
 
 
-def load_regression_data(path, dataset, targets_path=None, paths=None):
-    data, features = load_data(path, dataset, targets_path=targets_path, paths=paths)
+def load_regression_data(path, dataset, targets_path=None, paths=None, exclude_duplicate_lndb=False):
+    data, features = load_data(path, dataset, targets_path=targets_path, paths=paths,
+                               exclude_duplicate_lndb=exclude_duplicate_lndb)
     if (REGRESSION_TARGET not in data or not np.isfinite(data[REGRESSION_TARGET]).all()
             or not data[REGRESSION_TARGET].between(1, 5).all()):
         raise ValueError(f"{dataset}: regression targets must be finite reader means from 1 to 5.")
@@ -51,13 +52,16 @@ def main():
     parser.add_argument("--lidc-targets", type=Path, help="Explicit LIDC nodule population.")
     parser.add_argument("--lndb-targets", type=Path, help="Explicit LNDb nodule population, e.g. the saved ge3 targets.")
     parser.add_argument("--lndb-only", action="store_true", help="Train using only the LNDb training folds.")
+    parser.add_argument("--exclude-duplicate-lndb", action="store_true",
+                        help="Exclude confirmed duplicate LNDb CT scans. Default: use all scans.")
     parser.add_argument("--original-only", action="store_true", help="Use only features from the unfiltered Original image.")
     parser.add_argument("--output", type=Path, help="Directory for this experiment's results and model.")
     args = parser.parse_args()
     paths = load_paths(args.paths)
     args.lndb = args.lndb or paths["training"]["lndb_features"]
 
-    lndb, features = load_regression_data(args.lndb, "lndb", args.lndb_targets, paths)
+    lndb, features = load_regression_data(args.lndb, "lndb", args.lndb_targets, paths,
+                                          exclude_duplicate_lndb=args.exclude_duplicate_lndb)
     lidc = lndb.head(0)
     if not args.lndb_only:
         args.lidc = args.lidc or paths["training"]["lidc_features"]
@@ -73,7 +77,7 @@ def main():
     if len(folds) != 5:
         raise ValueError("Expected five saved LNDb folds.")
     name = args.lndb.stem if args.lndb_only else f"{args.lidc.stem}_{args.lndb.stem}"
-    output = args.output or paths["outputs"]["models"] / f"ridge_{name}{'_original' if args.original_only else ''}"
+    output = args.output or paths["outputs"]["models"] / f"ridge_{name}{'_original' if args.original_only else ''}{'_dedup' if args.exclude_duplicate_lndb else ''}"
     output.mkdir(parents=True, exist_ok=True)
     predictions = pd.Series(index=lndb.index, dtype=float)
     scores, continuous_scores = [], []
@@ -118,7 +122,9 @@ def main():
                  "lidc_csv": None if args.lndb_only else str(args.lidc.resolve()),
                  "lndb_csv": str(args.lndb.resolve()), "original_only": args.original_only,
                  "lidc_targets_csv": None if args.lndb_only else str(lidc_targets_path.resolve()),
-                 "lndb_targets_csv": str(lndb_targets_path.resolve())}, output / "model.joblib")
+                 "lndb_targets_csv": str(lndb_targets_path.resolve()),
+                  "excluded_lndb_ids": sorted(EXCLUDED_LNDB_IDS) if args.exclude_duplicate_lndb else []},
+                 output / "model.joblib")
     print(f"Saved regression and classification metrics, validation predictions and model to {output}")
 
 
