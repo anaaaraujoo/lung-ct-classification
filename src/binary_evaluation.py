@@ -82,8 +82,8 @@ def positive_score(model, values, binary=True):
     return probabilities[:, positive].sum(axis=1)
 
 
-def run_calibration(output):
-    """Fixed segmentation recipes with a separate threshold-calibration fold."""
+def run_calibration(output, top_k=None):
+    """Segmentation recipes with a separate threshold-calibration fold."""
     paths = load_paths()
     lndb, features = load_data(
         "data/lndb_ge3_segmentation_3d_c50_hu.csv", "lndb",
@@ -91,7 +91,9 @@ def run_calibration(output):
         exclude_duplicate_lndb=True,
     )
     lidc, _ = load_data("data/lidc_segmentation_3d_c50_hu.csv", "lidc", paths=paths)
-    recipes = {
+    if top_k is not None and not 1 <= top_k <= len(features):
+        raise ValueError(f"--top-k must be between 1 and {len(features)}.")
+    recipes = {f"Binary XGBoost, top {top_k} features": (True, "xgboost", False, None)} if top_k else {
         "Binary XGBoost, all features": (True, "xgboost", False, None),
         "Binary Balanced RF, all features": (True, "rf", True, None),
         "Binary RF, intensity": (True, "rf", False, ["firstorder"]),
@@ -108,7 +110,7 @@ def run_calibration(output):
             train = pd.concat([other, source.loc[train_rows]], ignore_index=True)
             calibration = source.loc[calibration_rows & source[BINARY_TARGET].notna()]
             test = source.loc[test_rows & source[BINARY_TARGET].notna()]
-            model = make_model(weight, balanced_forest=balanced_forest, model_kind=kind, binary=binary)
+            model = make_model(weight, k=top_k, balanced_forest=balanced_forest, model_kind=kind, binary=binary)
             fit_model(model, train[columns], train[target_column].astype(int), weight, 0)
             threshold = zero_fn_threshold(
                 calibration[BINARY_TARGET], positive_score(model, calibration[columns], binary),
@@ -140,11 +142,14 @@ def run_calibration(output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("models/segmentation_binary_calibration"))
+    parser.add_argument("--top-k", type=int, help="Evaluate only binary XGBoost with K features selected on training rows.")
     args = parser.parse_args()
+    if args.top_k is not None and args.top_k < 1:
+        parser.error("--top-k must be positive.")
     if args.output.exists() and any(args.output.iterdir()):
         parser.error(f"Output is not empty: {args.output}")
     args.output.mkdir(parents=True, exist_ok=True)
-    run_calibration(args.output)
+    run_calibration(args.output, top_k=args.top_k)
 
 
 if __name__ == "__main__":

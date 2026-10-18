@@ -119,6 +119,23 @@ class BinaryEvaluationTests(unittest.TestCase):
             self.assertFalse(predictions.duplicated(["model", "LNDbID", "FindingID"]).any())
             self.assertTrue(predictions.prediction.eq(predictions.target_binary_mean).all())
 
+            with patch("src.binary_evaluation.load_paths", return_value={"lndb": {"segmentation_targets": "targets.csv"}}), \
+                    patch("src.binary_evaluation.load_data", side_effect=[(table, features), (lidc, features)]), \
+                    patch("src.binary_evaluation.make_model", side_effect=lambda *args, **kw: Model(kw["binary"])) as factory, \
+                    patch("src.binary_evaluation.fit_model", side_effect=fit), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                run_calibration(output, top_k=1)
+            self.assertEqual(factory.call_count, 5)
+            self.assertTrue(all(call.kwargs["k"] == 1 and call.kwargs["model_kind"] == "xgboost"
+                                for call in factory.call_args_list))
+            selected = pd.read_csv(output / "validation_predictions.csv")
+            self.assertEqual(len(selected), 20)
+            self.assertEqual(selected.model.unique().tolist(), ["Binary XGBoost, top 1 features"])
+            self.assertTrue(selected.prediction.eq(selected.target_binary_mean).all())
+            for fold, ids in enumerate(fitted_ids[-5:], start=1):
+                excluded = set(table.loc[table.fold.isin([fold, fold % 5 + 1]), features[1]])
+                self.assertTrue(ids.isdisjoint(excluded))
+
 
 if __name__ == "__main__":
     unittest.main()
