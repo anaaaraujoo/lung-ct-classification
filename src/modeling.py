@@ -29,7 +29,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "target_classification_mean"
-FEATURE_PATTERN = r"_(shape|shape2D|firstorder|glcm|glrlm|glszm|gldm|ngtdm)_"
+FEATURE_PATTERN = r"_(shape|shape2D|firstorder|glcm|glrlm|glszm|gldm|ngtdm)_|^Feature\d+$"
 # Radiomics families. A feature belongs to the family named in its middle token,
 # for example original_shape_MeshVolume or wavelet-HL_gldm_DependenceNonUniformity.
 FEATURE_FAMILIES = ("shape", "shape2D", "firstorder", "glcm", "glrlm", "glszm", "gldm", "ngtdm")
