@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Create 3-D ROI NPZ files from LNDb testdata (.mhd/.raw) + testNodules.csv.
+Create 3-D ROI NPZ files from LNDb data (.mhd/.raw) + allNods.csv.
 
-For every nodule in testNodules.csv it:
+For every nodule in allNods.csv it:
   1. Loads the matching LNDb-####.mhd/.raw CT volume (int16 HU).
   2. Converts the nodule world centre (x,y,z in mm) to a voxel index using the
      volume's Offset and ElementSpacing.
@@ -15,7 +15,7 @@ For every nodule in testNodules.csv it:
          mask         bool   same shape    True inside the ROI
          spacing      float32 (3,)         voxel spacing (x, y, z) mm
          n_annotators int32  scalar        default 1
-         malignancy   float32 (0,)         empty (no label in testNodules.csv)
+         malignancy   float32 (0,)         empty (no label in allNods.csv)
          pad_xy, pad_z int32               voxels clamped per axis (info only)
          plus patient_id, finding_id, centre_vox, centre_world, roi_mm, source
 
@@ -138,18 +138,18 @@ def extract_cube(image, dims, centre_vox, size_vox, fill_hu):
 # Main
 # ---------------------------------------------------------------------------
 
-def find_volume_for_patient(testdata_dir, lndb_id):
-    """Return path to testdata/LNDb-####.mhd for the given LNDbID, or None."""
-    mhd = Path(testdata_dir) / f"LNDb-{int(lndb_id):04d}.mhd"
+def find_volume_for_patient(data_dir, lndb_id):
+    """Return path to data/LNDb-####.mhd for the given LNDbID, or None."""
+    mhd = Path(data_dir) / f"LNDb-{int(lndb_id):04d}.mhd"
     return mhd if mhd.is_file() else None
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--testdata-dir", default="testdata",
-                    help="Directory containing LNDb-####.mhd/.raw and testNodules.csv")
+    ap.add_argument("--data-dir", default="data",
+                    help="Directory containing LNDb-####.mhd/.raw and allNods.csv")
     ap.add_argument("--csv", default=None,
-                    help="Nodule CSV; defaults to <testdata-dir>/testNodules.csv")
+                    help="Nodule CSV; defaults to <data-dir>/allNods.csv")
     ap.add_argument("--out-dir", default="reconstructed_3d",
                     help="Output NPZ root (matches build_dataset_2d default input-dir)")
     ap.add_argument("--roi-mm", type=float, choices=[16.0, 32.0], default=32.0,
@@ -164,8 +164,8 @@ def main():
                     help="Only process findings whose LNDbID matches this value")
     args = ap.parse_args()
 
-    testdata_dir = Path(args.testdata_dir)
-    csv_path = Path(args.csv) if args.csv else testdata_dir / "testNodules.csv"
+    data_dir = Path(args.data_dir)
+    csv_path = Path(args.csv) if args.csv else data_dir / "allNods.csv"
     if not csv_path.is_file():
         raise SystemExit(f"Nodule CSV not found: {csv_path}")
 
@@ -176,6 +176,8 @@ def main():
     findings = []
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
+            if not row["Nodule"]:
+                continue
             lndb_id = int(row["LNDbID"])
             if args.patient is not None and str(lndb_id) != args.patient:
                 continue
@@ -195,7 +197,7 @@ def main():
     for finding in findings:
         pid = finding["lndb_id"]
         if pid not in volumes:
-            mhd = find_volume_for_patient(testdata_dir, pid)
+            mhd = find_volume_for_patient(data_dir, pid)
             if mhd is None:
                 print(f"[skip] no volume for patient LNDb-{pid:04d} "
                       f"(finding {finding['finding_id']})", flush=True)
