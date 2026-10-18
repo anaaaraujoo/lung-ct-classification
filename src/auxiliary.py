@@ -21,7 +21,6 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 
 ATTRIBUTES = ["lobulation", "spiculation", "sphericity", "margin", "texture"]
-CONCEPTS = ATTRIBUTES + ["calcification", "subtlety"]
 LIDC_KEYS = ["patient_id", "series_uid", "nodule_id"]
 LNDB_KEYS = ["LNDbID", "FindingID"]
 # The two annotation tables use different spellings for the same five ratings.
@@ -50,35 +49,6 @@ def load_attributes(data, dataset, paths):
         raise ValueError(f"{source} has no attributes for some {dataset} nodules.")
     return merged
 
-
-def load_concepts(data, dataset, paths):
-    """Load shared reader concepts, keeping calcification as presence, not a scale.
-
-    Calcification codes 1–5 describe types and 6 means none. LNDb also contains
-    averaged codes, which cannot identify a type. A value below 6 establishes
-    that at least one reader reported calcification. This same presence target
-    is used for LIDC. Invalid zero ratings and missing ratings remain unknown.
-    """
-    if dataset not in {"lidc", "lndb"}:
-        raise ValueError("Dataset must be lidc or lndb.")
-    keys = LIDC_KEYS if dataset == "lidc" else LNDB_KEYS
-    source = paths[dataset]["annotations" if dataset == "lidc" else "findings"]
-    names = {name if dataset == "lidc" else name.capitalize(): name for name in CONCEPTS}
-    table = pd.read_csv(Path(source).expanduser(), usecols=keys + list(names)).rename(columns=names)
-    for name in CONCEPTS:
-        values = pd.to_numeric(table[name], errors="coerce")
-        maximum = 6 if name == "calcification" else 5
-        table[name] = values.where(values.between(1, maximum))
-    known = table.calcification.notna()
-    table.loc[known, "calcification"] = table.loc[known, "calcification"].lt(6).astype(float)
-    aggregation = {name: "max" if name == "calcification" else "mean" for name in CONCEPTS}
-    ratings = table.groupby(keys, as_index=False).agg(aggregation)
-    merged = data.merge(ratings, on=keys, validate="one_to_one", how="left")
-    if merged[CONCEPTS].isna().all(axis=1).any():
-        raise ValueError(f"{source} has no concepts for some {dataset} nodules.")
-    return merged
-
-
 def default_regressor():
     """Predicts one radiologist rating from the radiomics features.
 
@@ -88,7 +58,6 @@ def default_regressor():
     return make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True),
                          RandomForestRegressor(n_estimators=300, max_features="sqrt",
                                                random_state=42, n_jobs=-1))
-
 
 class WithAttributes(BaseEstimator, ClassifierMixin):
     """A classifier that also sees the predicted radiologist attributes."""

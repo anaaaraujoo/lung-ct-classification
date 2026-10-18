@@ -1,4 +1,4 @@
-"""Fit Linear Regression w/ L2 regularization to continuous means and compare rounded classes on saved LNDb folds."""
+"""Fit Ridge to reader means or medians on saved LNDb folds."""
 import argparse
 from pathlib import Path
 
@@ -26,12 +26,14 @@ def to_classes(predictions):
     return np.clip(np.floor(np.asarray(predictions) + 0.5), 1, 5).astype(int)
 
 
-def load_regression_data(path, dataset, targets_path=None, paths=None, exclude_duplicate_lndb=False):
+def load_regression_data(path, dataset, targets_path=None, paths=None, exclude_duplicate_lndb=False,
+                         regression_target=REGRESSION_TARGET):
     data, features = load_data(path, dataset, targets_path=targets_path, paths=paths,
                                exclude_duplicate_lndb=exclude_duplicate_lndb)
-    if (REGRESSION_TARGET not in data or not np.isfinite(data[REGRESSION_TARGET]).all()
-            or not data[REGRESSION_TARGET].between(1, 5).all()):
-        raise ValueError(f"{dataset}: regression targets must be finite reader means from 1 to 5.")
+    if (regression_target not in data or not np.isfinite(data[regression_target]).all()
+            or not data[regression_target].between(1, 5).all()):
+        summary = regression_target.rsplit("_", 1)[-1]
+        raise ValueError(f"{dataset}: regression targets must be finite reader {summary}s from 1 to 5.")
     return data, features
 
 
@@ -54,18 +56,23 @@ def main():
     parser.add_argument("--lndb-only", action="store_true", help="Train using only the LNDb training folds.")
     parser.add_argument("--exclude-duplicate-lndb", action="store_true",
                         help="Exclude confirmed duplicate LNDb CT scans. Default: use all scans.")
+    parser.add_argument("--target", choices=["mean", "median"], default="mean",
+                        help="Reader rating summary to predict. Default: mean.")
     parser.add_argument("--original-only", action="store_true", help="Use only features from the unfiltered Original image.")
     parser.add_argument("--output", type=Path, help="Directory for this experiment's results and model.")
     args = parser.parse_args()
     paths = load_paths(args.paths)
     args.lndb = args.lndb or paths["training"]["lndb_features"]
+    regression_target = f"target_regression_{args.target}"
 
     lndb, features = load_regression_data(args.lndb, "lndb", args.lndb_targets, paths,
-                                          exclude_duplicate_lndb=args.exclude_duplicate_lndb)
+                                           exclude_duplicate_lndb=args.exclude_duplicate_lndb,
+                                           regression_target=regression_target)
     lidc = lndb.head(0)
     if not args.lndb_only:
         args.lidc = args.lidc or paths["training"]["lidc_features"]
-        lidc, lidc_features = load_regression_data(args.lidc, "lidc", args.lidc_targets, paths)
+        lidc, lidc_features = load_regression_data(args.lidc, "lidc", args.lidc_targets, paths,
+                                                   regression_target=regression_target)
         if set(features) != set(lidc_features):
             raise ValueError("LIDC and LNDb must contain the same radiomics features.")
         features = lidc_features
@@ -77,30 +84,33 @@ def main():
     if len(folds) != 5:
         raise ValueError("Expected five saved LNDb folds.")
     name = args.lndb.stem if args.lndb_only else f"{args.lidc.stem}_{args.lndb.stem}"
-    output = args.output or paths["outputs"]["models"] / f"ridge_{name}{'_original' if args.original_only else ''}{'_dedup' if args.exclude_duplicate_lndb else ''}"
+    suffix = ("_median" if args.target == "median" else "")
+    suffix += "_original" if args.original_only else ""
+    suffix += "_dedup" if args.exclude_duplicate_lndb else ""
+    output = args.output or paths["outputs"]["models"] / f"ridge_{name}{suffix}"
     output.mkdir(parents=True, exist_ok=True)
     predictions = pd.Series(index=lndb.index, dtype=float)
     scores, continuous_scores = [], []
-    print(f"Ridge: {len(features)} features, target: {REGRESSION_TARGET}", flush=True)
+    print(f"Ridge: {len(features)} features, target: {regression_target}", flush=True)
     for fold in folds:
         held_out = lndb["fold"].eq(fold)
         train = pd.concat([lidc, lndb.loc[~held_out]], ignore_index=True)
         model = make_model()
         print(f"Fold {fold}: {len(train)} training / {held_out.sum()} validation nodules", flush=True)
-        model.fit(train[features], train[REGRESSION_TARGET])
+        model.fit(train[features], train[regression_target])
         prediction = model.predict(lndb.loc[held_out, features])
         predictions.loc[held_out] = prediction
-        continuous_scores.append({"fold": fold, **regression_metrics(lndb.loc[held_out, REGRESSION_TARGET], prediction)})
+        continuous_scores.append({"fold": fold, **regression_metrics(lndb.loc[held_out, regression_target], prediction)})
         scores.append({"fold": fold, **metrics(lndb.loc[held_out, TARGET], to_classes(prediction))})
         print(pd.Series(scores[-1]).to_string(), flush=True)
         print(pd.Series(continuous_scores[-1]).drop("fold").add_prefix("regression_").to_string(), flush=True)
 
     classes = to_classes(predictions)
-    continuous_scores.append({"fold": "overall_oof", **regression_metrics(lndb[REGRESSION_TARGET], predictions)})
+    continuous_scores.append({"fold": "overall_oof", **regression_metrics(lndb[regression_target], predictions)})
     scores.append({"fold": "overall_oof", **metrics(lndb[TARGET], classes)})
     pd.DataFrame(continuous_scores).to_csv(output / "regression_metrics.csv", index=False)
     pd.DataFrame(scores).to_csv(output / "metrics.csv", index=False)
-    oof = lndb[["LNDbID", "FindingID", "fold", REGRESSION_TARGET, TARGET]].copy()
+    oof = lndb[["LNDbID", "FindingID", "fold", regression_target, TARGET]].copy()
     oof["prediction_continuous"] = predictions
     oof["prediction"] = classes
     oof.to_csv(output / "validation_predictions.csv", index=False)
@@ -114,10 +124,10 @@ def main():
 
     print(f"Fitting final model on all {'LNDb' if args.lndb_only else 'LIDC + LNDb'} training nodules", flush=True)
     train = pd.concat([lidc, lndb], ignore_index=True)
-    model = make_model().fit(train[features], train[REGRESSION_TARGET])
+    model = make_model().fit(train[features], train[regression_target])
     lidc_targets_path = None if args.lndb_only else (args.lidc_targets or paths["lidc"]["targets"])
     lndb_targets_path = args.lndb_targets or paths["lndb"]["targets"]
-    joblib.dump({"model": model, "features": features, "target": REGRESSION_TARGET,
+    joblib.dump({"model": model, "features": features, "target": regression_target,
                  "model_kind": "ridge", "class_conversion": "half_up_clip_1_5", "label_offset": 0,
                  "lidc_csv": None if args.lndb_only else str(args.lidc.resolve()),
                  "lndb_csv": str(args.lndb.resolve()), "original_only": args.original_only,
