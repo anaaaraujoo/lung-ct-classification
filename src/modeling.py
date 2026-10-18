@@ -21,15 +21,29 @@ from xgboost import XGBClassifier
 
 # Support both `python src/modeling.py` and importing `src.modeling`.
 if __package__:
+    from .auxiliary import ATTRIBUTES, WithAttributes, load_attributes
     from .radiomics_extraction import load_paths
 else:
+    from auxiliary import ATTRIBUTES, WithAttributes, load_attributes
     from radiomics_extraction import load_paths
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "target_classification_mean"
 FEATURE_PATTERN = r"_(shape|shape2D|firstorder|glcm|glrlm|glszm|gldm|ngtdm)_"
+# Radiomics families. A feature belongs to the family named in its middle token,
+# for example original_shape_MeshVolume or wavelet-HL_gldm_DependenceNonUniformity.
+FEATURE_FAMILIES = ("shape", "shape2D", "firstorder", "glcm", "glrlm", "glszm", "gldm", "ngtdm")
+# Groups make the common splits easy to ask for on the command line.
+FAMILY_GROUPS = {"texture": ("glcm", "glrlm", "glszm", "gldm", "ngtdm"),
+                 "intensity": ("firstorder",),
+                 "shape": ("shape", "shape2D")}
 SLICE_IN_NODULE = "slice_in_nodule"
-# Equal raw SHA-256 and image headers in notebooks/radiomics_results_analysis.ipynb.
+# Nodule volume in mm3, used by the size experiments. Segmentation masks provide it.
+SIZE_COLUMN = "original_shape_MeshVolume"
+LIDC_KEYS = ["patient_id", "series_uid", "nodule_id"]
+LNDB_KEYS = ["LNDbID", "FindingID"]
+
+# Equal raw SHA-256 and image headers in notebooks/radiomics_decisions_eda.ipynb.
 # Retain the lower LNDbID in each confirmed pair.
 EXCLUDED_LNDB_IDS = frozenset({181, 182, 183, 184, 185, 188, 189, 194, 195, 198, 226})
 MIN_SAMPLES_GRID = {
@@ -66,7 +80,7 @@ def load_data(path, dataset, targets_path=None, paths=None, binary=False, multi_
     """Load requested nodules on saved folds, optionally excluding LNDb CT copies."""
     table = pd.read_csv(path)
     features = table.filter(regex=FEATURE_PATTERN).columns.tolist()
-    keys = ["patient_id", "series_uid", "nodule_id"] if dataset == "lidc" else ["LNDbID", "FindingID"]
+    keys = LIDC_KEYS if dataset == "lidc" else LNDB_KEYS
     slice_keys = keys + [SLICE_IN_NODULE] if multi_slice else keys
     locations = (paths or load_paths())[dataset]
     targets_file = targets_path or locations["targets"]
@@ -105,6 +119,67 @@ def load_data(path, dataset, targets_path=None, paths=None, binary=False, multi_
     data[features] = data[features].replace([np.inf, -np.inf], np.nan)
     return data.drop(columns="_merge"), features
 
+def feature_inventory(directory):
+    """Summarise the saved training feature CSVs."""
+    prefixes = (
+        "lidc_circle_", "lidc_segmentation_", "lidc_sphere_",
+        "lndb_circle_", "lndb_ge3_segmentation_", "lndb_sphere_",
+    )
+    rows = []
+
+    for path in sorted(Path(directory).glob("*.csv")):
+        if not path.name.startswith(prefixes):
+            continue
+
+        name = path.stem
+        dataset = "LIDC" if name.startswith("lidc_") else "LNDb"
+        keys = LIDC_KEYS if dataset == "LIDC" else LNDB_KEYS
+
+        header = pd.read_csv(path, nrows=0)
+        identifiers = pd.read_csv(path, usecols=keys)
+
+        region = (
+            "sphere" if "_sphere_" in name
+            else "segmentation" if "_segmentation_" in name
+            else "circle"
+        )
+        method = (
+            "2.5D" if "_5slice_" in name
+            else "3D" if region == "sphere" or "_3d_" in name
+            else "2D"
+        )
+
+        rows.append({
+            "dataset": dataset,
+            "region": region,
+            "method": method,
+            "CSV": path.name,
+            "nodules": len(identifiers.drop_duplicates()),
+            "rows": len(identifiers),
+            "features": len(header.filter(regex=FEATURE_PATTERN).columns),
+        })
+
+    return pd.DataFrame(rows)
+
+def attach_size(data, dataset, paths):
+    """Add nodule size from the shape table when the features carry no shape.
+
+    Circle and sphere features describe a fixed region, so they have no shape
+    columns. The size experiments still need a size, and the masks give one for
+    the same nodules.
+    """
+    if SIZE_COLUMN in data.columns:
+        return data
+    keys = LIDC_KEYS if dataset == "lidc" else LNDB_KEYS
+    table = paths["shape"][dataset]
+    shape = pd.read_csv(table, usecols=keys + [SIZE_COLUMN])
+    if shape[keys].duplicated().any():
+        raise ValueError(f"{table}: repeated nodule IDs.")
+    merged = data.merge(shape, on=keys, validate="many_to_one", how="left")
+    if merged[SIZE_COLUMN].isna().any():
+        raise ValueError(f"{table} does not cover every {dataset} nodule in this run.")
+    return merged
+
 
 def prefer_normalized_pairs(features):
     raw = {name.removesuffix("Normalized") for name in features if name.endswith("Normalized")}
@@ -113,19 +188,60 @@ def prefer_normalized_pairs(features):
     return [name for name in features if name not in raw]
 
 
-def aggregate_slices(rows, prediction, keys):
-    """Weighted mean of per-slice predictions; centre slices weigh most."""
-    frame = rows[keys + [SLICE_IN_NODULE]].copy()
-    frame["prediction"] = np.asarray(prediction, dtype=float)
+def feature_family(name):
+    """Radiomics family a feature belongs to, read from its name."""
+    for token in name.split("_"):
+        if token in FEATURE_FAMILIES:
+            return token
+    raise ValueError(f"{name} does not look like a radiomics feature.")
+
+
+def select_families(features, requested):
+    """Keep the requested radiomics families, accepting group names like texture."""
+    wanted = set()
+    for group in requested:
+        group = group.strip()
+        if group in FAMILY_GROUPS:
+            wanted.update(FAMILY_GROUPS[group])
+        elif group in FEATURE_FAMILIES:
+            wanted.add(group)
+        else:
+            raise ValueError(f"Unknown feature family {group!r}. Use any of "
+                             f"{sorted(FEATURE_FAMILIES + tuple(FAMILY_GROUPS))}.")
+    return [name for name in features if feature_family(name) in wanted]
+
+
+def size_confounded_features(features, frame, maximum, column=SIZE_COLUMN):
+    """Features whose Spearman correlation with nodule size exceeds the limit."""
+    if column not in frame.columns:
+        raise ValueError(f"{column} is missing. Size experiments need segmentation features.")
+    correlations = frame[features].corrwith(frame[column], method="spearman").abs()
+    return [name for name in features if correlations[name] > maximum]
+
+
+def aggregate_slices(rows, values, keys):
+    """Weighted mean of per-slice values, one row per nodule. Centre slices weigh most.
+
+    Pass one value per slice, or a table with one column per class to average
+    probabilities. Returns a Series for single values and a table otherwise.
+    """
+    single = not isinstance(values, pd.DataFrame)
+    frame = pd.DataFrame(np.asarray(values, dtype=float), index=rows.index)
+    frame.columns = ["value"] if single else list(values.columns)
+    values_columns = list(frame.columns)
+    frame[keys] = rows[keys].to_numpy()
+    frame[SLICE_IN_NODULE] = rows[SLICE_IN_NODULE].to_numpy()
     frame = frame.sort_values(keys + [SLICE_IN_NODULE], kind="stable")
     grouped = frame.groupby(list(keys), sort=False)
     position = grouped.cumcount().to_numpy()
-    size = grouped["prediction"].transform("size").to_numpy()
+    size = grouped[SLICE_IN_NODULE].transform("size").to_numpy()
     # Triangular weights 1, 2, ..., centre, ..., 2, 1 over the nodule's slices.
     frame["weight"] = np.minimum(position + 1, size - position)
-    frame["weighted_prediction"] = frame["prediction"] * frame["weight"]
-    totals = frame.groupby(list(keys), sort=False)[["weighted_prediction", "weight"]].sum()
-    return totals["weighted_prediction"] / totals["weight"]
+    for column in values_columns:
+        frame[column] = frame[column] * frame["weight"]
+    totals = frame.groupby(list(keys), sort=False)[values_columns + ["weight"]].sum()
+    result = totals[values_columns].div(totals["weight"], axis=0)
+    return result["value"] if single else result
 
 
 def make_model(class_weight=None, k=None, smote=False, balanced_forest=False, model_kind="rf", binary=False):
@@ -240,7 +356,20 @@ def main():
     parser.add_argument("--class-weight", choices=["none", "balanced"], default="none")
     parser.add_argument("--model", choices=["rf", "logistic", "xgboost"], default="rf")
     parser.add_argument("--original-only", action="store_true", help="Use only features from the unfiltered Original image.")
+    parser.add_argument("--family", help="Keep only these radiomics families, comma separated. "
+                                         "Use firstorder, glcm, glrlm, glszm, gldm, ngtdm, shape, or the groups "
+                                         "texture (all five texture families) and intensity (firstorder).")
     parser.add_argument("--normalized-pairs", action="store_true", help="Keep normalized radiomics features instead of their raw counterparts.")
+    parser.add_argument("--size-only", action="store_true",
+                        help=f"Use only {SIZE_COLUMN}, the volume baseline for size experiments.")
+    parser.add_argument("--max-size-correlation", type=float,
+                        help="Drop features whose Spearman correlation with nodule size exceeds this value. "
+                             "Correlations are measured on training rows only.")
+    parser.add_argument("--auxiliary-attributes", action="store_true",
+                        help="Add the radiologists' own attributes (lobulation, spiculation, sphericity, "
+                             "margin, texture) as extra features, predicted from the radiomics inside each "
+                             "fold. They exist only for training nodules, never for a test nodule. Requires "
+                             "--model rf without tuning or --multi-slice.")
     parser.add_argument("--smote", action="store_true", help="Scale features and balance classes with SMOTE on training data only.")
     parser.add_argument("--balanced-forest", action="store_true", help="Balance each tree's training sample by undersampling.")
     parser.add_argument("--multi-slice", action="store_true",
@@ -271,6 +400,8 @@ def main():
     if do_tune and (args.tune and args.quick_tune or args.tune_rf or args.binary or args.multi_slice or args.smote or
                    not (args.balanced_forest or args.model == "xgboost" and args.class_weight == "balanced")):
         parser.error("Tuning requires five-class Balanced RF or XGBoost with --class-weight balanced, without SMOTE or multi-slice. Choose one tuning flag.")
+    if args.auxiliary_attributes and (args.model != "rf" or do_tune or args.tune_rf or args.multi_slice):
+        parser.error("--auxiliary-attributes requires --model rf without tuning or --multi-slice.")
     if args.smote or args.balanced_forest:
         # imbalanced-learn 0.12 uses these older APIs, which still work in sklearn 1.6.
         warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn\.base",
@@ -287,12 +418,37 @@ def main():
         if set(features) != set(lidc_features):
             raise ValueError("LIDC and LNDb must contain the same radiomics features.")
         features = lidc_features
+    if args.auxiliary_attributes:
+        # The attributes are targets of their own, so they never enter `features`.
+        lndb = load_attributes(lndb, "lndb", paths)
+        if not args.lndb_only:
+            lidc = load_attributes(lidc, "lidc", paths)
+        print(f"Auxiliary attributes: {', '.join(ATTRIBUTES)}", flush=True)
+    if args.size_only or args.max_size_correlation is not None:
+        # Circle and sphere features have no shape columns, so take the size from the masks.
+        if SIZE_COLUMN not in lndb.columns:
+            lndb = attach_size(lndb, "lndb", paths)
+            print(f"Nodule size taken from {paths['shape']['lndb']}", flush=True)
+        if not args.lndb_only and SIZE_COLUMN not in lidc.columns:
+            lidc = attach_size(lidc, "lidc", paths)
+            print(f"Nodule size taken from {paths['shape']['lidc']}", flush=True)
     if args.original_only:
         features = [column for column in features if column.startswith("original_")]
         if not features:
             parser.error("No Original features found in the supplied CSVs.")
+    if args.family:
+        try:
+            features = select_families(features, args.family.split(","))
+        except ValueError as error:
+            parser.error(str(error))
+        if not features:
+            parser.error(f"No features left in the requested families: {args.family}")
     if args.normalized_pairs:
         features = prefer_normalized_pairs(features)
+    if args.size_only:
+        if SIZE_COLUMN not in lndb.columns:
+            parser.error(f"--size-only needs {SIZE_COLUMN} in the feature CSV or in the shape table.")
+        features = [SIZE_COLUMN]
     class_weight = None if args.class_weight == "none" else args.class_weight
     label_offset = int(args.model == "xgboost" and not args.binary)
     if args.k is not None and not 1 <= args.k <= len(features):
@@ -302,7 +458,7 @@ def main():
         raise ValueError("Expected five saved LNDb folds.")
     name = args.lndb.stem if args.lndb_only else f"{args.lidc.stem}_{args.lndb.stem}"
     kind = "brf" if args.balanced_forest else args.model
-    output = args.output or paths["outputs"]["models"] / f"{kind}_{name}{'_balanced' if class_weight else ''}{f'_k{args.k}' if args.k is not None else ''}{'_smote' if args.smote else ''}{'_original' if args.original_only else ''}{'_normalized_pairs' if args.normalized_pairs else ''}{'_quick_tuned' if args.quick_tune else '_tuned' if args.tune_rf or args.tune else ''}{'_binary' if args.binary else ''}{'_multislice' if args.multi_slice else ''}{'_dedup' if args.exclude_duplicate_lndb else ''}"
+    output = args.output or paths["outputs"]["models"] / f"{kind}_{name}{'_balanced' if class_weight else ''}{f'_k{args.k}' if args.k is not None else ''}{'_smote' if args.smote else ''}{'_original' if args.original_only else ''}{'_aux' if args.auxiliary_attributes else ''}{'_family-' + args.family.replace(',', '+').replace(' ', '') if args.family else ''}{'_normalized_pairs' if args.normalized_pairs else ''}{'_sizeonly' if args.size_only else ''}{f'_maxsize{args.max_size_correlation}' if args.max_size_correlation is not None else ''}{'_quick_tuned' if args.quick_tune else '_tuned' if args.tune_rf or args.tune else ''}{'_binary' if args.binary else ''}{'_multislice' if args.multi_slice else ''}{'_dedup' if args.exclude_duplicate_lndb else ''}"
     if not (do_tune or args.tune_rf) and any(word in output.name.lower() for word in ("grid", "tuned")):
         parser.error("Output name suggests tuning, but no tuning flag was supplied.")
     if (do_tune or args.tune_rf) and output.exists() and any(output.iterdir()):
@@ -312,48 +468,86 @@ def main():
     lndb_keys = ["LNDbID", "FindingID"]
     nodules = lndb.drop_duplicates(lndb_keys) if args.multi_slice else lndb
     predictions = pd.Series(index=nodules.index, dtype=float)
+    probability_names = [f"proba_{label}" for label in labels]
+    probabilities = pd.DataFrame(index=nodules.index, columns=probability_names, dtype=float)
     scores = []
     tuning, training_scores = [], []
+
+    def new_model():
+        base = make_model(class_weight, args.k, args.smote, args.balanced_forest, args.model, args.binary)
+        return WithAttributes(base) if args.auxiliary_attributes else base
+
+    def fit_on(model, frame, feature_columns):
+        if args.auxiliary_attributes:
+            # The attributes are extra inputs the classifier never sees at test.
+            model.fit(frame[feature_columns], frame[target], frame[ATTRIBUTES])
+        else:
+            fit_model(model, frame[feature_columns], frame[target], class_weight, label_offset)
+        return model
+
     print(f"{kind}: {len(features)} features, class weights: {args.class_weight}, target: {target}", flush=True)
     for fold in folds:
         held_out = lndb["fold"].eq(fold)
         held_out_nodules = nodules["fold"].eq(fold)
         train = pd.concat([lidc, lndb.loc[~held_out]], ignore_index=True)
-        model = make_model(class_weight, args.k, args.smote, args.balanced_forest, args.model, args.binary)
+        model = new_model()
         print(f"Fold {fold}: {len(train)} training / {held_out_nodules.sum()} validation nodules", flush=True)
+        fold_features = features
+        if args.max_size_correlation is not None:
+            dropped = size_confounded_features(features, train, args.max_size_correlation)
+            fold_features = [column for column in features if column not in dropped]
+            print(f"Fold {fold}: dropped {len(dropped)} of {len(features)} features correlated with size"
+                  f" above {args.max_size_correlation}", flush=True)
         if args.tune_rf:
-            search = tune_rf(model, train, features, len(lidc), output, f"fold_{fold}", args.binary)
+            search = tune_rf(model, train, fold_features, len(lidc), output, f"fold_{fold}", args.binary)
             model = search.best_estimator_
             tuning.append({"fold": fold, "inner_macro_f1": search.best_score_, **search.best_params_})
-            training_prediction = model.predict(train[features])
+            training_prediction = model.predict(train[fold_features])
             training_scores.append({"fold": fold, "accuracy": accuracy_score(train[target], training_prediction),
                                     **metrics(train[target], training_prediction, args.binary)})
             pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
             pd.DataFrame(training_scores).to_csv(output / "training_metrics.csv", index=False)
         elif do_tune:
-            model, score, params = tune_balanced_model(model, train, features, len(lidc), output,
+            model, score, params = tune_balanced_model(model, train, fold_features, len(lidc), output,
                                                        f"fold_{fold}", class_weight, label_offset,
                                                        args.balanced_forest, quick=args.quick_tune)
             tuning.append({"fold": fold, "inner_balanced_accuracy": score, **params})
             pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
         else:
-            fit_model(model, train[features], train[target], class_weight, label_offset)
-        slice_prediction = model.predict(lndb.loc[held_out, features]) + label_offset
+            fit_on(model, train, fold_features)
+        held_out_rows = lndb.loc[held_out, fold_features]
+        slice_prediction = model.predict(held_out_rows) + label_offset
+        slice_probabilities = None
+        if hasattr(model, "predict_proba"):
+            values = model.predict_proba(held_out_rows)
+            names = [f"proba_{int(label) + label_offset}" for label in model.classes_]
+            slice_probabilities = pd.DataFrame(values, index=held_out_rows.index, columns=names)[probability_names]
         if args.multi_slice:
             # Train on every slice, then combine the slice predictions per nodule.
             prediction = aggregate_slices(lndb.loc[held_out], slice_prediction, lndb_keys)
             index = pd.MultiIndex.from_frame(nodules.loc[held_out_nodules, lndb_keys])
             prediction = np.rint(prediction.reindex(index)).clip(min(labels), max(labels)).astype(int)
             predictions.loc[held_out_nodules] = prediction.to_numpy()
+            if slice_probabilities is not None:
+                aggregated = aggregate_slices(lndb.loc[held_out], slice_probabilities, lndb_keys)
+                probabilities.loc[held_out_nodules, probability_names] = aggregated.reindex(index).to_numpy()
             scores.append({"fold": fold, **metrics(nodules.loc[held_out_nodules, target], prediction, args.binary)})
         else:
             predictions.loc[held_out] = slice_prediction
+            if slice_probabilities is not None:
+                probabilities.loc[held_out, probability_names] = slice_probabilities.to_numpy()
             scores.append({"fold": fold, **metrics(lndb.loc[held_out, target], slice_prediction, args.binary)})
         print(pd.Series(scores[-1]).to_string(), flush=True)
     scores.append({"fold": "overall_oof", **metrics(nodules[target], predictions, args.binary)})
     pd.DataFrame(scores).to_csv(output / "metrics.csv", index=False)
     oof = nodules[["LNDbID", "FindingID", "fold", target]].copy()
     oof["prediction"] = predictions.astype(int)
+    if not probabilities.isna().to_numpy().any():
+        # Saved so several models can be combined on their shared nodules.
+        if not np.allclose(probabilities.sum(axis=1), 1, atol=1e-6):
+            raise ValueError("Class probabilities must sum to one.")
+        for name in probability_names:
+            oof[name] = probabilities[name].to_numpy()
     oof.to_csv(output / "validation_predictions.csv", index=False)
     confusion = pd.DataFrame(confusion_matrix(nodules[target], predictions, labels=labels), index=labels, columns=labels)
     confusion.to_csv(output / "confusion_matrix.csv", index_label="true_class")
@@ -361,18 +555,24 @@ def main():
     print(f"Fitting final model on all {'LNDb' if args.lndb_only else 'LIDC + LNDb'} training"
           f" {'slices' if args.multi_slice else 'nodules'}", flush=True)
     train = pd.concat([lidc, lndb], ignore_index=True)
-    model = make_model(class_weight, args.k, args.smote, args.balanced_forest, args.model, args.binary)
+    model = new_model()
+    final_features = features
+    if args.max_size_correlation is not None:
+        dropped = size_confounded_features(features, train, args.max_size_correlation)
+        final_features = [column for column in features if column not in dropped]
+        print(f"Final model: dropped {len(dropped)} of {len(features)} features correlated with size"
+              f" above {args.max_size_correlation}", flush=True)
     tuning_info = {}
     if args.tune_rf:
         # Choose final parameters using all five LNDb folds, never competition test data.
-        search = tune_rf(model, train, features, len(lidc), output, "final", args.binary)
+        search = tune_rf(model, train, final_features, len(lidc), output, "final", args.binary)
         model = search.best_estimator_
         tuning.append({"fold": "final", "inner_macro_f1": search.best_score_, **search.best_params_})
         pd.DataFrame(tuning).to_csv(output / "tuning.csv", index=False)
         tuning_info = {"param_grid": MIN_SAMPLES_GRID, "tuning_scoring": "macro_f1",
                         "best_params": search.best_params_, "inner_cv": "saved LNDb folds, LIDC training only"}
     elif do_tune:
-        model, score, params = tune_balanced_model(model, train, features, len(lidc), output, "final",
+        model, score, params = tune_balanced_model(model, train, final_features, len(lidc), output, "final",
                                                    class_weight, label_offset, args.balanced_forest,
                                                    quick=args.quick_tune)
         tuning.append({"fold": "final", "inner_balanced_accuracy": score, **params})
@@ -385,18 +585,22 @@ def main():
                        "inner_cv": ("one saved LNDb fold with most class-5 nodules, LIDC training only" if args.quick_tune
                                     else "saved LNDb folds, LIDC training only")}
     else:
-        fit_model(model, train[features], train[target], class_weight, label_offset)
+        fit_on(model, train, final_features)
     lidc_targets_path = args.lidc_targets or paths["lidc"]["targets"]
     lndb_targets_path = args.lndb_targets or paths["lndb"]["targets"]
-    joblib.dump({"model": model, "features": features, "target": target,
+    joblib.dump({"model": model, "features": final_features, "target": target,
                  "lidc_csv": None if args.lndb_only else str(args.lidc.resolve()),
                  "lndb_csv": str(args.lndb.resolve()), "class_weight": class_weight, "k": args.k,
                  "lidc_targets_csv": None if args.lndb_only else str(lidc_targets_path.resolve()),
                  "lndb_targets_csv": str(lndb_targets_path.resolve()),
                  "smote": args.smote, "balanced_forest": args.balanced_forest,
                   "model_kind": args.model, "label_offset": label_offset, "original_only": args.original_only,
+                  "family": args.family,
+                  "auxiliary_attributes": args.auxiliary_attributes,
                   "normalized_pairs": args.normalized_pairs,
                   "multi_slice": args.multi_slice,
+                  "size_only": args.size_only,
+                  "max_size_correlation": args.max_size_correlation,
                   "excluded_lndb_ids": sorted(EXCLUDED_LNDB_IDS) if args.exclude_duplicate_lndb else [],
                  **tuning_info}, output / "model.joblib")
     print(f"Saved metrics, validation predictions and model to {output}")

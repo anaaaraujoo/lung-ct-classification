@@ -14,6 +14,13 @@ lndb:
   targets: data/processed/lndb_nodule_targets.csv
   segmentation_targets: data/processed/lndb_ge3_nodule_targets.csv
   folds: data/processed/lndb_patient_folds.csv
+  characteristics: ~/Downloads/LNDb/chars_trainNodules.csv
+
+# Nodule size for the experiments that need it. Shape features come from the masks,
+# so circle and sphere features have to take size from here.
+shape:
+  lidc: data/lidc_segmentation_3d_c50_hu.csv
+  lndb: data/lndb_ge3_segmentation_3d_c50_hu.csv
 
 radiomics:
   circle: configs/radiomics_circle_2d.yaml

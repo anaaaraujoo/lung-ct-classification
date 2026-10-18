@@ -24,5 +24,10 @@ dependencies = [
     "xgboost>=2.1.4,<3",
 ]
 
+[dependency-groups]
+dev = [
+    "shap==0.46.0",
+]
+
 [tool.uv]
 package = false

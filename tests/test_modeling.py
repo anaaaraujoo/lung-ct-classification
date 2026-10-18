@@ -9,11 +9,21 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import joblib
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import ParameterGrid
+from sklearn.pipeline import make_pipeline
 
-from src.modeling import EXCLUDED_LNDB_IDS, MIN_SAMPLES_GRID, QUICK_FOREST_GRID, QUICK_XGBOOST_GRID, TARGET, fit_model, lndb_cv, load_data, main as train_classifier, make_model, metrics, prefer_normalized_pairs, tune_balanced_model, tune_rf
+from src.modeling import EXCLUDED_LNDB_IDS, MIN_SAMPLES_GRID, QUICK_FOREST_GRID, QUICK_XGBOOST_GRID, TARGET, feature_family, fit_model, lndb_cv, load_data, main as train_classifier, make_model, metrics, prefer_normalized_pairs, select_families, tune_balanced_model, tune_rf
+from src.auxiliary import ATTRIBUTES, WithAttributes, load_attributes
 from src.make_predictions import main as make_submission
 from src.regression import load_regression_data
+
+
+def tiny_regressor():
+    """A two-tree attribute model, so the tests stay fast."""
+    return make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True),
+                         RandomForestRegressor(n_estimators=2, random_state=0))
 
 
 class RFTuningTests(unittest.TestCase):
@@ -26,6 +36,20 @@ class RFTuningTests(unittest.TestCase):
         self.assertEqual(prefer_normalized_pairs(features), [features[1], features[3], features[4]])
         with self.assertRaisesRegex(ValueError, "No raw/Normalized"):
             prefer_normalized_pairs([features[4]])
+
+    def test_feature_families_split_radiomics_features(self):
+        features = ["original_shape_MeshVolume", "original_firstorder_Mean",
+                    "original_glcm_Contrast", "wavelet-HL_gldm_DependenceNonUniformity",
+                    "log-sigma-1-0-mm-3D_glrlm_RunLengthNonUniformity", "lbp-3D-m1_ngtdm_Contrast"]
+        self.assertEqual(select_families(features, ["texture"]),
+                         [features[2], features[3], features[4], features[5]])
+        self.assertEqual(select_families(features, ["intensity"]), [features[1]])
+        self.assertEqual(select_families(features, ["shape", "gldm"]), [features[0], features[3]])
+        self.assertEqual(select_families(features, ["firstorder", "ngtdm"]), [features[1], features[5]])
+        with self.assertRaisesRegex(ValueError, "Unknown feature family"):
+            select_families(features, ["colour"])
+        with self.assertRaisesRegex(ValueError, "does not look like"):
+            feature_family("LNDbID")
 
     def test_grid_and_defaults(self):
         self.assertEqual(MIN_SAMPLES_GRID["randomforestclassifier__min_samples_leaf"], [1, 5, 10, 20])
@@ -412,6 +436,102 @@ class BinaryTests(unittest.TestCase):
                                  0, Path(directory), "test", binary=True)
             self.assertEqual(search.best_score_, 1.)
             np.testing.assert_array_equal(search.best_estimator_.classes_, [0, 1])
+
+
+class AuxiliaryAttributeTests(unittest.TestCase):
+    def test_load_attributes_averages_readers(self):
+        with TemporaryDirectory(prefix="attributes-", dir="/tmp/opencode") as directory:
+            findings = Path(directory) / "allNods.csv"
+            pd.DataFrame({
+                "LNDbID": [1, 1, 2, 3], "FindingID": [10, 10, 20, 30],
+                "Lobulation": [1, 3, 2, 2], "Spiculation": [1, 1, 2, 2], "Sphericity": [4, 4, 3, 3],
+                "Margin": [5, 3, 4, 4], "Texture": [5, 5, 4, 4],
+            }).to_csv(findings, index=False)
+            data = pd.DataFrame({"LNDbID": [1, 2, 3], "FindingID": [10, 20, 30], "fold": [1, 2, 3]})
+            merged = load_attributes(data, "lndb", {"lndb": {"findings": str(findings)}})
+            self.assertEqual(merged["lobulation"].tolist(), [2.0, 2.0, 2.0])
+            self.assertEqual(merged["margin"].tolist(), [4.0, 4.0, 4.0])
+            self.assertEqual(list(merged.columns)[-len(ATTRIBUTES):], ATTRIBUTES)
+
+    def test_load_attributes_requires_every_nodule(self):
+        with TemporaryDirectory(prefix="attributes-", dir="/tmp/opencode") as directory:
+            findings = Path(directory) / "allNods.csv"
+            pd.DataFrame({"LNDbID": [1], "FindingID": [10], "Lobulation": [2], "Spiculation": [2],
+                          "Sphericity": [3], "Margin": [4], "Texture": [5]}).to_csv(findings, index=False)
+            data = pd.DataFrame({"LNDbID": [1, 2], "FindingID": [10, 20]})
+            with self.assertRaisesRegex(ValueError, "no attributes"):
+                load_attributes(data, "lndb", {"lndb": {"findings": str(findings)}})
+
+    def test_with_attributes_adds_predicted_columns(self):
+        generator = np.random.default_rng(0)
+        columns = [f"original_firstorder_{index}" for index in range(6)]
+        X = pd.DataFrame(generator.normal(size=(60, 6)), columns=columns)
+        attributes = pd.DataFrame({name: generator.integers(1, 6, 60) for name in ATTRIBUTES})
+        y = generator.integers(1, 6, 60)
+        model = WithAttributes(make_model("balanced"), regressor=tiny_regressor(), inner_splits=2)
+        model.fit(X, y, attributes)
+        self.assertEqual(len(model.attribute_models_), len(ATTRIBUTES))
+        self.assertEqual(model.classifier_.n_features_in_, 6 + len(ATTRIBUTES))
+        probabilities = model.predict_proba(X.head(4))
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1, atol=1e-9)
+        self.assertEqual(len(model.predict(X.head(4))), 4)
+        self.assertTrue(set(np.unique(model.classes_)).issubset(set(y)))
+
+    def test_cli_trains_with_auxiliary_attributes(self):
+        with TemporaryDirectory(prefix="auxiliary-", dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            lidc = pd.DataFrame({"patient_id": list(range(1, 6)),
+                                 "series_uid": [f"s{label}" for label in range(1, 6)],
+                                 "nodule_id": [1] * 5, TARGET: list(range(1, 6)),
+                                 "original_firstorder_Mean": list(range(1, 6))})
+            lndb = pd.DataFrame([{"LNDbID": 10 * fold + label, "FindingID": 1, "fold": fold,
+                                  TARGET: label, "original_firstorder_Mean": float(label)}
+                                 for fold in range(1, 6) for label in range(1, 6)])
+            lidc.drop(columns=TARGET).to_csv(root / "lidc.csv", index=False)
+            lndb.drop(columns=[TARGET, "fold"]).to_csv(root / "lndb.csv", index=False)
+            lidc.drop(columns="original_firstorder_Mean").to_csv(root / "lidc_targets.csv", index=False)
+            lndb.drop(columns=["original_firstorder_Mean", "fold"]).rename(
+                columns={"FindingID": "NoduleID"}).to_csv(root / "lndb_targets.csv", index=False)
+            lidc[["patient_id"]].assign(fold=1).to_csv(root / "lidc_folds.csv", index=False)
+            lndb[["LNDbID", "fold"]].to_csv(root / "lndb_folds.csv", index=False)
+            lidc[["patient_id", "series_uid", "nodule_id"]].assign(
+                **{name: 2.0 for name in ATTRIBUTES}).to_csv(root / "lidc_annotations.csv", index=False)
+            lndb[["LNDbID", "FindingID"]].assign(**{"Lobulation": 2.0, "Spiculation": 2.0,
+                "Sphericity": 3.0, "Margin": 4.0, "Texture": 5.0}).to_csv(root / "allNods.csv", index=False)
+            paths = {"lidc": {"targets": root / "lidc_targets.csv", "folds": root / "lidc_folds.csv",
+                              "annotations": str(root / "lidc_annotations.csv")},
+                     "lndb": {"targets": root / "lndb_targets.csv", "folds": root / "lndb_folds.csv",
+                              "findings": str(root / "allNods.csv")},
+                     "training": {"lidc_features": root / "lidc.csv", "lndb_features": root / "lndb.csv"},
+                     "outputs": {"models": root}}
+
+            def tiny_model(*args, **kwargs):
+                model = make_model(*args, **kwargs)
+                return model.set_params(randomforestclassifier__n_estimators=2)
+
+            output = root / "auxiliary"
+            args = ["modeling.py", "--lidc", str(root / "lidc.csv"), "--lndb", str(root / "lndb.csv"),
+                    "--class-weight", "balanced", "--auxiliary-attributes", "--output", str(output)]
+            with patch("sys.argv", args), patch("src.modeling.load_paths", return_value=paths), \
+                    patch("src.modeling.make_model", side_effect=tiny_model), \
+                    patch("src.auxiliary.default_regressor", tiny_regressor), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                train_classifier()
+            saved = joblib.load(output / "model.joblib")
+            self.assertTrue(saved["auxiliary_attributes"])
+            self.assertIsInstance(saved["model"], WithAttributes)
+            validation = pd.read_csv(output / "validation_predictions.csv")
+            self.assertEqual(len(validation), 25)
+            self.assertEqual(sum(name.startswith("proba_") for name in validation.columns), 5)
+
+            rejected = ["modeling.py", "--lidc", str(root / "lidc.csv"), "--lndb", str(root / "lndb.csv"),
+                        "--model", "xgboost", "--class-weight", "balanced", "--auxiliary-attributes",
+                        "--output", str(root / "rejected")]
+            with patch("sys.argv", rejected), patch("src.modeling.load_paths", return_value=paths), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    train_classifier()
+            self.assertFalse((root / "rejected").exists())
 
 
 if __name__ == "__main__":
