@@ -10,3 +10,6 @@ models/
 data/*
 !data/lidc_circle_r11_hu.csv
 !data/lndb_circle_r6_hu.csv
+
+# Ignore large datasets
+allTestFeat.csv
